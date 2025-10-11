@@ -62,13 +62,17 @@ def process_tar(
 
     items = []
     for sample in iter_audio_samples(tar_path):
-        items.append(
-            {
+        try:
+            item = {
                 "audio_src_id": sample.audio_src_id,
                 "mimi": get_quantized_mimi_features(mimi, sample).cpu(),
                 "qwen": get_qwen_omni_features(qwen_omni, processor, sample).cpu(),
             }
-        )
+            items.append(item)
+        except Exception as e:
+            print(f"[rank {rank}] ERROR processing {tar_path}: {e}", flush=True)
+            continue
+
         if len(items) % 100 == 0:
             torch.cuda.empty_cache()
 
