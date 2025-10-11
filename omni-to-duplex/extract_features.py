@@ -1,14 +1,14 @@
 import argparse
 import os
-import torch
-
 from pathlib import Path
-from huggingface_hub import hf_hub_download
-from moshi.models import loaders, MimiModel
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
-from tqdm import tqdm
 
-from data_util import load_audio_samples, get_quantized_mimi_features, get_qwen_omni_features
+import torch
+from huggingface_hub import hf_hub_download
+from moshi.models import MimiModel, loaders
+from tqdm import tqdm
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
+
+from data_util import get_quantized_mimi_features, get_qwen_omni_features, load_audio_samples
 
 
 def process_tar(

@@ -1,20 +1,17 @@
 import json
 import tarfile
-import soundfile as sf
-import numpy as np
-import torch
-import torchaudio
-from pathlib import Path
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Optional, Generator, Sequence, Iterator
+from pathlib import Path
+from typing import Generator, Optional
+
+import numpy as np
+import soundfile as sf
+import torch
+import torchaudio
 from moshi.models import MimiModel
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
 from qwen_omni_utils import process_mm_info
-from torch.nn.utils.rnn import pad_sequence
-from torch.utils.data import IterableDataset, DataLoader, get_worker_info
-import torch.distributed as dist
-import os
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
 
 
 @dataclass
@@ -38,12 +35,12 @@ class AudioSample:
                 orig_freq=self.audio_sample_rate,
                 new_freq=new_sample_rate,
             )
-        
+
         return waveform
 
     def save_wav(self, path: str | Path) -> None:
         with open(path, "wb") as f:
-            sf.write(f, self.audio, self.audio_sample_rate) 
+            sf.write(f, self.audio, self.audio_sample_rate)
 
     @property
     def duration(self) -> float:
@@ -68,7 +65,7 @@ def load_audio_samples(path: str | Path) -> dict[str, AudioSample]:
                 unstructured_data[key]["audio"] = audio
                 assert sr == unstructured_data[key]["audio_sample_rate"]
                 assert audio.ndim == 1 and len(audio) == unstructured_data[key]["audio_length"]
-        
+
     return {k: AudioSample(**v) for k, v in unstructured_data.items()}
 
 
@@ -103,7 +100,7 @@ def get_quantized_mimi_features(mimi: MimiModel, sample: AudioSample) -> torch.T
 
 @torch.inference_mode()
 def get_qwen_omni_features(
-    qwen_omni: Qwen2_5OmniForConditionalGeneration, 
+    qwen_omni: Qwen2_5OmniForConditionalGeneration,
     processor: Qwen2_5OmniProcessor,
     sample: AudioSample,
 ) -> torch.Tensor:
@@ -114,4 +111,3 @@ def get_qwen_omni_features(
     inputs = inputs.to(param.device, param.dtype)
     with torch.no_grad():
         return qwen_omni.thinker.get_audio_features(inputs.input_features, inputs.feature_attention_mask)
-    
