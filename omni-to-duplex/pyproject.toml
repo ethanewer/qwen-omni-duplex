@@ -1,0 +1,17 @@
+[project]
+name = "omni-to-duplex"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ipykernel>=6.30.1",
+    "ipywidgets>=8.1.7",
+    "matplotlib>=3.10.7",
+    "pydantic>=2.12.0",
+    "soundfile>=0.13.1",
+    "torch>=2.8.0",
+    "torchaudio>=2.8.0",
+    "torchvision>=0.23.0",
+    "transformers>=4.57.0",
+]
