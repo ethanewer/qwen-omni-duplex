@@ -107,10 +107,11 @@ def get_qwen_omni_features(
     processor: Qwen2_5OmniProcessor,
     sample: AudioSample,
 ) -> torch.Tensor:
+    param = next(iter(qwen_omni.parameters()))
     conversation = [{"role": "user", "content": [{"type": "audio", "audio": sample.audio}]}]
     audios, _, _ = process_mm_info(conversation, use_audio_in_video=True)  # type: ignore
     inputs = processor(text="", audio=audios, return_tensors="pt", padding=True, use_audio_in_video=True)
-    inputs = inputs.to(qwen_omni.device, qwen_omni.dtype)
+    inputs = inputs.to(param.device, param.dtype)
     with torch.no_grad():
         return qwen_omni.thinker.get_audio_features(inputs.input_features, inputs.feature_attention_mask)
     
