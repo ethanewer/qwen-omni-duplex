@@ -3,12 +3,15 @@ uv run accelerate launch \
   --config_file configs/fsdp_config.yaml \
   train_adaptor.py \
   --do_train True \
-  --do_eval False \
+  --do_eval True \
   --num_train_epochs 1 \
+  --max_steps 10 \
   --fp16 False \
   --bf16 True \
   --tf32 False \
   --gradient_checkpointing False \
+  --eval_strategy steps \
+  --eval_steps 1 \
   --save_strategy steps \
   --save_steps 2500 \
   --save_total_limit 3 \
@@ -21,4 +24,6 @@ uv run accelerate launch \
   --per_device_train_batch_size 128 \
   --gradient_accumulation_steps 1 \
   --disable_tqdm False \
+  --data_path ../../../../mnt/efs/fs1/extracted_audio_features/ \
+  --final_filename final_adaptor.pt \
   $@
