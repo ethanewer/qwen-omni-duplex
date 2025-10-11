@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 ACCELERATE_SPLIT_BATCHES=true \
 uv run accelerate launch \
   --config_file configs/fsdp_config.yaml \
   train_adaptor.py \
@@ -16,7 +16,7 @@ uv run accelerate launch \
   --save_steps 2500 \
   --save_total_limit 3 \
   --logging_strategy steps \
-  --logging_steps 100 \
+  --logging_steps 1 \
   --report_to tensorboard \
   --learning_rate 1e-5 \
   --warmup_ratio 0.1 \
@@ -26,4 +26,5 @@ uv run accelerate launch \
   --disable_tqdm False \
   --data_path ../../../../mnt/efs/fs1/extracted_audio_features/ \
   --final_filename final_adaptor.pt \
+  --max_eval_dataset_size 512 \
   $@

@@ -1,11 +1,12 @@
 import gc
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 import torch
+import torch.nn.functional as F
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import IterableDataset
 from transformers.activations import silu
 from transformers.configuration_utils import PretrainedConfig
@@ -28,6 +29,8 @@ class AdaptorRunArguments:
     output_size: int = field(default=2048, metadata={"help": "Adaptor output feature size."})
     intermediate_size: int = field(default=8192, metadata={"help": "Hidden size for MLP."})
     output_timesteps: int = field(default=2, metadata={"help": "Timesteps produced per input step."})
+    max_input_seq_len: int = field(default=512, metadata={"help": "Max input sequence length."})
+    max_eval_dataset_size: Optional[int] = field(default=None, metadata={"help": "Max eval dataset size."})
     compile: bool = field(default=False, metadata={"help": "Use torch.compile on the base adaptor."})
     final_filename: str = field(default="adaptor.pt", metadata={"help": "Filename of final saved adaptor weights."})
 
@@ -63,23 +66,26 @@ class Adaptor(nn.Module):
         down_proj: torch.Tensor = self.down_proj(self.act_fn(self.gate_proj(inputs)) * self.up_proj(inputs))
         pred = down_proj.view(*inputs.shape[:-2], -1, self.output_size)
         outputs = {"logits": pred}
-        if targets:
+        if targets is not None:
             squared_error = (pred - targets).square()
-            if mask:
+            if mask is not None:
                 outputs["loss"] = (squared_error * mask).sum() / mask.sum().clamp_min(1.0)
             else:
+                print("WARNING: mask is None.")
                 outputs["loss"] = squared_error.mean()
 
         return outputs
 
 
 class FeatureShardIterableDataset(IterableDataset):
-    def __init__(self, shard_paths: list[Path]):
+    def __init__(self, shard_paths: list[Path], max_size: Optional[int] = None):
         self.shard_paths = sorted([p for p in shard_paths if p.suffix == ".pt"])
+        self.max_size = max_size
         if not self.shard_paths:
             raise FileNotFoundError("No .pt shards found.")
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        count = 0
         for shard_path in self.shard_paths:
             print("Loading shard.")
             data = torch.load(shard_path, map_location="cpu")
@@ -87,30 +93,55 @@ class FeatureShardIterableDataset(IterableDataset):
             items = data.get("items", [])
             for item in items:
                 yield item
+                count += 1
+                if self.max_size is not None and count > self.max_size:
+                    return
 
             del data
             gc.collect()
 
 
-def collate_fn_alignment(batch: list[dict[str, Any]]) -> dict[str, Any]:
-    xs: list[torch.Tensor] = []
-    ys: list[torch.Tensor] = []
+def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int) -> dict[str, Any]:
+    inputs: list[torch.Tensor] = []
+    targets: list[torch.Tensor] = []
+    masks: list[torch.Tensor] = []
+
     for b in batch:
         x: torch.Tensor = b["mimi_features"]
         y: torch.Tensor = b["qwen_omni_features"]
-        min_size = min(x.shape[0], y.shape[0] // 2)
-        if min_size > 0:
-            xs.append(x[:min_size])
-            ys.append(y[: 2 * min_size])
+        mask = torch.ones_like(y[:, :1])
 
-    x_batch = pad_sequence(xs, batch_first=True)
-    y_batch = pad_sequence(ys, batch_first=True)
-    mask = pad_sequence([torch.ones_like(y[..., :1]) for y in ys], batch_first=True)
-    return {"x": x_batch, "y": y_batch, "mask": mask}
+        max_pairs = min(x.shape[0], y.shape[0] // 2, max_input_seq_len)
+        if max_pairs == 0:
+            continue
+        elif x.shape[0] > max_input_seq_len:
+            x = x[:max_input_seq_len]
+            y = y[: 2 * max_input_seq_len]
+            mask = mask[: 2 * max_input_seq_len]
+        elif x.shape[0] < max_input_seq_len:
+            x = F.pad(x, (0, 0, 0, max_input_seq_len - x.shape[0]), value=0)
+            y = F.pad(y, (0, 0, 0, 2 * max_input_seq_len - y.shape[0]), value=0)
+            mask = F.pad(mask, (0, 0, 0, 2 * max_input_seq_len - mask.shape[0]), value=0)
+
+        assert x.shape[0] == max_input_seq_len
+        assert y.shape[0] == 2 * max_input_seq_len
+        assert mask.shape[0] == 2 * max_input_seq_len
+
+        inputs.append(x)
+        targets.append(y)
+        masks.append(mask)
+
+    return {
+        "inputs": torch.stack(inputs, dim=0),
+        "targets": torch.stack(targets, dim=0),
+        "mask": torch.stack(masks, dim=0),
+    }
 
 
 def compute_metrics(eval_pred):
-    print(eval_pred)
+    print("<compute_metrics>")
+    print(eval_pred.__dict__.keys())
+    print("</compute_metrics>")
     return {"r2": 0}
 
 
@@ -118,6 +149,7 @@ def parse_args() -> tuple[AdaptorRunArguments, TrainingArguments]:
     parser = HfArgumentParser((AdaptorRunArguments, TrainingArguments))  # type: ignore
     run_args, training_args = parser.parse_args_into_dataclasses()  # type: ignore
     training_args.remove_unused_columns = False
+    training_args.label_names = ["targets"]  # type: ignore
     return run_args, training_args
 
 
@@ -130,19 +162,20 @@ def main() -> None:
     shard_paths = [p for p in data_root.iterdir() if p.is_file() and p.suffix == ".pt"]
     assert len(shard_paths) > 1
     train_dataset = FeatureShardIterableDataset(shard_paths[:-1])
-    eval_dataset = FeatureShardIterableDataset(shard_paths[-1:])
+    eval_dataset = FeatureShardIterableDataset(shard_paths[-1:], max_size=run_args.max_eval_dataset_size)
 
     adaptor_config = run_args.adaptor_config
     model: nn.Module = Adaptor(adaptor_config)
     if run_args.compile and hasattr(torch, "compile"):
-        model.compile()
+        model = torch.compile(model)  # type: ignore
 
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
-        data_collator=collate_fn_alignment,
+        compute_metrics=compute_metrics,
+        data_collator=partial(collate_fn_alignment, max_input_seq_len=run_args.max_input_seq_len),
     )
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
