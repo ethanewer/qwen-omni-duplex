@@ -80,16 +80,17 @@ def process_tar(
 
 def parse_args() -> tuple[Path, Path]:
     parser = argparse.ArgumentParser(description="Extract Mimi & Qwen features (resume-safe, multi-GPU).")
+    fs_path = Path("/") / "mnt/efs/fs1"
     parser.add_argument(
         "--tts_data_path",
         type=Path,
-        default=Path("../../../../mnt/efs/fs1/extracted_audio_features"),
+        default=fs_path / "wbl/webdataset/webdataset/train/tts_en",
         help="Directory containing .tar files (one dataset shard per file).",
     )
     parser.add_argument(
         "--out_dir",
         type=Path,
-        default=Path("./feature_cache_local"),
+        default=fs_path / "extracted_audio_features",
         help="Local directory for cached outputs (*.pt).",
     )
     args = parser.parse_args()
