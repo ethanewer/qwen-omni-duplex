@@ -1,17 +1,14 @@
-import os
 import argparse
+import os
 import torch
 import torch.distributed as dist
 
 from pathlib import Path
 from huggingface_hub import hf_hub_download
-from torch.nn.utils.rnn import pad_sequence
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
-from torch import nn
-from transformers.activations import silu
 from moshi.models import loaders, MimiModel
-from dataclasses import dataclass
-from data_util import iter_audio_samples, AudioSample, get_quantized_mimi_features, get_qwen_omni_features
+from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
+
+from data_util import iter_audio_samples, get_quantized_mimi_features, get_qwen_omni_features
 
 
 def ddp_init():
