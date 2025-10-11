@@ -4,6 +4,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -64,15 +65,11 @@ class Adaptor(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         down_proj: torch.Tensor = self.down_proj(self.act_fn(self.gate_proj(inputs)) * self.up_proj(inputs))
-        pred = down_proj.view(*inputs.shape[:-2], -1, self.output_size)
-        outputs = {"logits": pred}
+        preds = down_proj.view(*inputs.shape[:-2], -1, self.output_size)
+        outputs = {"logits": preds}
         if targets is not None:
-            squared_error = (pred - targets).square()
-            if mask is not None:
-                outputs["loss"] = (squared_error * mask).sum() / mask.sum().clamp_min(1.0)
-            else:
-                print("WARNING: mask is None.")
-                outputs["loss"] = squared_error.mean()
+            assert mask is not None
+            outputs["loss"] = ((preds - targets).square() * mask).sum() / mask.sum().clamp_min(1.0)
 
         return outputs
 
@@ -86,15 +83,14 @@ class FeatureShardIterableDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         count = 0
-        for shard_path in self.shard_paths:
-            print("Loading shard.")
+        for idx, shard_path in enumerate(self.shard_paths):
+            print(f"Loading shard {idx + 1}/{len(self.shard_paths)}.")
             data = torch.load(shard_path, map_location="cpu")
-            print("Completed loading shard.")
             items = data.get("items", [])
             for item in items:
                 yield item
                 count += 1
-                if self.max_size is not None and count > self.max_size:
+                if self.max_size is not None and count >= self.max_size:
                     return
 
             del data
@@ -139,17 +135,33 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int) ->
 
 
 def compute_metrics(eval_pred):
-    print("<compute_metrics>")
-    print(eval_pred.__dict__.keys())
-    print("</compute_metrics>")
-    return {"r2": 0}
+    preds = eval_pred.predictions
+
+    if isinstance(eval_pred.label_ids, (tuple, list)):
+        targets, mask = eval_pred.label_ids
+    else:
+        targets = eval_pred.label_ids
+        mask = None
+
+    if mask is not None:
+        assert isinstance(mask, np.ndarray)
+    else:
+        mask = np.ones_like(targets[:, :, :1])
+
+    assert isinstance(preds, np.ndarray) and isinstance(targets, np.ndarray) and isinstance(mask, np.ndarray)
+
+    count = max(mask.sum(), 1)
+    mse = (np.square(preds - targets) * mask).sum() / count
+    mean = (targets * mask).sum(axis=(0, 1)) / count
+    var = (np.square(targets - mean) * mask).sum() / count
+    return {"r2": 1 - mse / var}
 
 
 def parse_args() -> tuple[AdaptorRunArguments, TrainingArguments]:
     parser = HfArgumentParser((AdaptorRunArguments, TrainingArguments))  # type: ignore
     run_args, training_args = parser.parse_args_into_dataclasses()  # type: ignore
     training_args.remove_unused_columns = False
-    training_args.label_names = ["targets"]  # type: ignore
+    training_args.label_names = ["targets", "mask"]  # type: ignore
     return run_args, training_args
 
 

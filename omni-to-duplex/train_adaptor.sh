@@ -5,18 +5,18 @@ uv run accelerate launch \
   --do_train True \
   --do_eval True \
   --num_train_epochs 1 \
-  --max_steps 10 \
+  --max_steps 1000000 \
   --fp16 False \
   --bf16 True \
   --tf32 False \
   --gradient_checkpointing False \
   --eval_strategy steps \
-  --eval_steps 1 \
+  --eval_steps 1000 \
   --save_strategy steps \
-  --save_steps 2500 \
+  --save_steps 1000 \
   --save_total_limit 3 \
   --logging_strategy steps \
-  --logging_steps 1 \
+  --logging_steps 10 \
   --report_to tensorboard \
   --learning_rate 1e-5 \
   --warmup_ratio 0.1 \
@@ -26,5 +26,5 @@ uv run accelerate launch \
   --disable_tqdm False \
   --data_path ../../../../mnt/efs/fs1/extracted_audio_features/ \
   --final_filename final_adaptor.pt \
-  --max_eval_dataset_size 512 \
+  --max_eval_dataset_size 8192 \
   $@
