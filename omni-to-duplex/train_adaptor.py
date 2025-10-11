@@ -42,11 +42,10 @@ class Adaptor(nn.Module):
 
 def parse_args() -> Path:
     parser = argparse.ArgumentParser(description="Extract Mimi & Qwen features (resume-safe, multi-GPU).")
-    fs_path = Path("/") / "mnt/efs/fs1"
     parser.add_argument(
         "--data_path",
         type=Path,
-        default=fs_path / "extracted_audio_features",
+        default=Path("/") / "mnt/efs/fs1/extracted_audio_features",
     )
     args = parser.parse_args()
     return args.data_path
@@ -54,6 +53,9 @@ def parse_args() -> Path:
 
 
 if __name__ == "__main__":
+    data_path = parse_args()
+    data_files = [p for p in data_path.iterdir() if p.is_file() and p.suffix in [".pt"]]
+
     processor = Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-3B")
     model = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         "Qwen/Qwen2.5-Omni-3B", 

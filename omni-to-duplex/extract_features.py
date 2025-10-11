@@ -1,41 +1,16 @@
 import argparse
 import os
 import torch
-import torch.distributed as dist
 
 from pathlib import Path
 from huggingface_hub import hf_hub_download
 from moshi.models import loaders, MimiModel
 from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
+from tqdm import tqdm
 
-from data_util import iter_audio_samples, get_quantized_mimi_features, get_qwen_omni_features
-
-
-def ddp_init():
-    if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
-        dist.init_process_group(backend="nccl", init_method="env://")
-        rank = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        local_rank = int(os.environ.get("LOCAL_RANK", 0))
-        torch.cuda.set_device(local_rank)
-        return True, rank, world_size, local_rank
-    else:
-        rank = 0
-        world_size = 1
-        local_rank = int(os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")[0]) if torch.cuda.is_available() else 0
-        if torch.cuda.is_available():
-            torch.cuda.set_device(0)
-        return False, rank, world_size, 0
+from data_util import load_audio_samples, get_quantized_mimi_features, get_qwen_omni_features
 
 
-def ddp_barrier(is_dist: bool):
-    if is_dist and dist.is_initialized():
-        dist.barrier()
-
-
-def ddp_cleanup(is_dist: bool):
-    if is_dist and dist.is_initialized():
-        dist.destroy_process_group()
 
 
 def process_tar(
@@ -44,7 +19,6 @@ def process_tar(
     mimi: MimiModel,
     qwen_omni: Qwen2_5OmniForConditionalGeneration,
     processor: Qwen2_5OmniProcessor,
-    rank: int = 0,
 ) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = tar_path.stem
@@ -52,31 +26,42 @@ def process_tar(
     out_final = out_dir / f"{stem}.pt"
 
     if out_final.exists():
-        print(f"[rank {rank}] SKIP (cached): {tar_path}")
+        print(f"Skipping {tar_path} (cached)")
         return
 
-    print(f"[rank {rank}] Processing: {tar_path}")
+    samples = load_audio_samples(tar_path)
 
-    items = []
-    for sample in iter_audio_samples(tar_path):
+    mimi_features = {}
+    for key, sample in tqdm(samples.items(), desc="Encoding Mimi"):
         try:
-            item = {
-                "audio_src_id": sample.audio_src_id,
-                "mimi": get_quantized_mimi_features(mimi, sample).cpu(),
-                "qwen": get_qwen_omni_features(qwen_omni, processor, sample).cpu(),
-            }
-            items.append(item)
+            mimi_features[key] = get_quantized_mimi_features(mimi, sample).cpu()
         except Exception as e:
-            print(f"[rank {rank}] ERROR processing {tar_path}: {e}", flush=True)
+            print(f"ERROR processing {tar_path}: {e}", flush=True)
             continue
 
-        if len(items) % 100 == 0:
-            torch.cuda.empty_cache()
+    qwen_omni_features = {}
+    for key, sample in tqdm(samples.items(), desc="Encoding Qwen-Omni"):
+        try:
+            qwen_omni_features[key] = get_qwen_omni_features(qwen_omni, processor, sample).cpu()
+        except Exception as e:
+            print(f"ERROR processing {tar_path} ({key}): {e}", flush=True)
+            continue
 
-    results = {"source_file": str(tar_path), "items": items}
+    results = {
+        "source_file": str(tar_path),
+        "items": [
+            {
+                "mimi_features": mimi_features[key],
+                "qwen_omni_features": qwen_omni_features[key],
+                "audio_src_id": samples[key].audio_src_id,
+            } for key in sorted(set(mimi_features.keys()) & set(qwen_omni_features.keys()))
+        ],
+    }
+
+    torch.cuda.empty_cache()
     torch.save(results, out_tmp)
     os.replace(out_tmp, out_final)
-    print(f"[rank {rank}] Wrote: {out_final} (items: {len(items)})")
+    print(f"Wrote {len(results["items"])} to {out_final}.")
 
 
 def parse_args() -> tuple[Path, Path]:
@@ -98,45 +83,23 @@ def parse_args() -> tuple[Path, Path]:
 
 def main() -> None:
     tts_data_path, out_dir = parse_args()
-    is_dist, rank, world_size, local_rank = ddp_init()
-    if rank == 0:
-        print(f"[world_size={world_size}] Starting extraction to: {out_dir.resolve()}")
-
     processor = Qwen2_5OmniProcessor.from_pretrained("Qwen/Qwen2.5-Omni-3B")
     qwen_omni = Qwen2_5OmniForConditionalGeneration.from_pretrained(
         "Qwen/Qwen2.5-Omni-3B",
         torch_dtype=torch.bfloat16,
-        device_map="auto" if not dist.is_initialized() else {"": torch.device(f"cuda:{local_rank}")},
+        device_map="auto",
     )
     qwen_omni.disable_talker()
     qwen_omni.eval()
 
     mimi_weight = hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME)
-    mimi = loaders.get_mimi(mimi_weight, device=f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu").to(torch.bfloat16)
+    mimi = loaders.get_mimi(mimi_weight, device="cuda" if torch.cuda.is_available() else "cpu").to(torch.bfloat16)
     mimi.set_num_codebooks(8)
     mimi.eval()
 
-    ddp_barrier(is_dist)
+    data_files = sorted([p for p in tts_data_path.iterdir() if p.is_file() and p.suffix in [".tar"]])
 
-    if rank == 0:
-        all_files = sorted([p for p in tts_data_path.iterdir() if p.is_file() and p.suffix in [".tar"]])
-    else:
-        all_files = None
-
-    if is_dist:
-        obj_list = [all_files] if rank == 0 else [None]
-        dist.broadcast_object_list(obj_list, src=0)
-        all_files = obj_list[0]
-
-    if not all_files:
-        if rank == 0:
-            print("No input .tar files found. Exiting.")
-
-        ddp_cleanup(is_dist)
-        return
-
-    for idx in range(rank, len(all_files), world_size):
-        tar_path = all_files[idx]
+    for tar_path in tqdm(data_files, desc="Processing files"):
         try:
             process_tar(
                 tar_path=tar_path,
@@ -144,16 +107,9 @@ def main() -> None:
                 mimi=mimi,
                 qwen_omni=qwen_omni,
                 processor=processor,
-                rank=rank,
             )
         except Exception as e:
-            print(f"[rank {rank}] ERROR processing {tar_path}: {e}", flush=True)
-
-        ddp_barrier(is_dist)
-
-    ddp_cleanup(is_dist)
-    if rank == 0:
-        print("All file completed.")
+            print(f"ERROR processing {tar_path}: {e}", flush=True)
 
 
 if __name__ == "__main__":
