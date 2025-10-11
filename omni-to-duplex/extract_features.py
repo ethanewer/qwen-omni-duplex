@@ -11,8 +11,6 @@ from tqdm import tqdm
 from data_util import load_audio_samples, get_quantized_mimi_features, get_qwen_omni_features
 
 
-
-
 def process_tar(
     tar_path: Path,
     out_dir: Path,
