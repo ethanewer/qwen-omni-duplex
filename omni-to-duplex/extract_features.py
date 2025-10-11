@@ -86,13 +86,11 @@ def parse_args() -> tuple[Path, Path]:
         "--tts_data_path",
         type=Path,
         default=fs_path / "wbl/webdataset/webdataset/train/tts_en",
-        help="Directory containing .tar files (one dataset shard per file).",
     )
     parser.add_argument(
         "--out_dir",
         type=Path,
         default=fs_path / "extracted_audio_features",
-        help="Local directory for cached outputs (*.pt).",
     )
     args = parser.parse_args()
     return args.tts_data_path, args.out_dir

@@ -1,4 +1,5 @@
 import os
+import argparse
 import torch
 
 from pathlib import Path
@@ -39,6 +40,17 @@ class Adaptor(nn.Module):
 
 
 
+def parse_args() -> Path:
+    parser = argparse.ArgumentParser(description="Extract Mimi & Qwen features (resume-safe, multi-GPU).")
+    fs_path = Path("/") / "mnt/efs/fs1"
+    parser.add_argument(
+        "--data_path",
+        type=Path,
+        default=fs_path / "extracted_audio_features",
+    )
+    args = parser.parse_args()
+    return args.data_path
+
 
 
 if __name__ == "__main__":
@@ -60,4 +72,5 @@ if __name__ == "__main__":
         output_timesteps=2,
     )
     adaptor = Adaptor(adaptor_config).to("cuda", torch.bfloat16)
-    # TODO
+    
+    
