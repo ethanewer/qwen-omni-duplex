@@ -5,7 +5,7 @@ uv run accelerate launch \
   --do_train True \
   --do_eval True \
   --num_train_epochs 1 \
-  --max_steps 100000 \
+  --max_steps 10000 \
   --fp16 False \
   --bf16 True \
   --tf32 False \
@@ -18,8 +18,8 @@ uv run accelerate launch \
   --logging_strategy steps \
   --logging_steps 10 \
   --report_to tensorboard \
-  --learning_rate 1e-3 \
-  --warmup_ratio 1e-3 \
+  --learning_rate 0.001 \
+  --warmup_ratio 0.01 \
   --lr_scheduler_type cosine \
   --per_device_train_batch_size 64 \
   --gradient_accumulation_steps 1 \
