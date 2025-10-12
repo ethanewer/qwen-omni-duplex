@@ -19,8 +19,8 @@ from transformers.training_args import TrainingArguments
 class AdaptorConfig(PretrainedConfig):
     input_size: int
     output_size: int
-    intermediate_size: int = 8192
-    output_timesteps: int = 1
+    intermediate_size: int
+    output_timesteps: int
 
 
 @dataclass

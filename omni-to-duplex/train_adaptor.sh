@@ -4,8 +4,8 @@ uv run accelerate launch \
   train_adaptor.py \
   --do_train True \
   --do_eval True \
-  --num_train_epochs 3 \
-  --max_steps 10000 \
+  --num_train_epochs 1 \
+  --max_steps 100000 \
   --fp16 False \
   --bf16 True \
   --tf32 False \
@@ -19,10 +19,12 @@ uv run accelerate launch \
   --logging_steps 10 \
   --report_to tensorboard \
   --learning_rate 1e-3 \
-  --warmup_ratio 0.01 \
+  --warmup_ratio 1e-3 \
   --lr_scheduler_type cosine \
   --per_device_train_batch_size 64 \
   --gradient_accumulation_steps 1 \
+  --per_device_eval_batch_size 64 \
+  --eval_accumulation_steps 4 \
   --disable_tqdm False \
   --data_path ../../../../mnt/efs/fs1/extracted_audio_features/ \
   --final_filename final_adaptor.pt \
