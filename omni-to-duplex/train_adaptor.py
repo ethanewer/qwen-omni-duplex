@@ -9,18 +9,24 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.data import IterableDataset
-from transformers.activations import silu
+from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
 from transformers.hf_argparser import HfArgumentParser
+from transformers.models.qwen3 import Qwen3Config, Qwen3Model
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
+
+
+def debug_xml(obj, name: str) -> None:
+    obj_str = "\n".join(str(obj)[:1024].split("\n")[:16])
+    print(f"<{name}>\n{obj_str}\n</{name}>")
 
 
 class AdaptorConfig(PretrainedConfig):
     input_size: int
     output_size: int
-    intermediate_size: int
     output_timesteps: int
+    decoder_config: Qwen3Config
 
 
 @dataclass
@@ -28,8 +34,15 @@ class AdaptorRunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
     input_size: int = field(default=512, metadata={"help": "Adaptor input feature size."})
     output_size: int = field(default=2048, metadata={"help": "Adaptor output feature size."})
-    intermediate_size: int = field(default=8192, metadata={"help": "Hidden size for MLP."})
     output_timesteps: int = field(default=2, metadata={"help": "Timesteps produced per input step."})
+    adaptor_decoder_config_path: str = field(
+        default="configs/adaptor_decoder_config.json",
+        metadata={"help": "Path to a Qwen3Model config."},
+    )
+    attn_implementation: Optional[str] = field(
+        default="flash_attention_2",
+        metadata={"help": "Must be 'flash_attention_2' for sliding window attention."},
+    )
     max_input_seq_len: int = field(default=512, metadata={"help": "Max input sequence length."})
     max_eval_dataset_size: Optional[int] = field(default=None, metadata={"help": "Max eval dataset size."})
     compile: bool = field(default=False, metadata={"help": "Use torch.compile on the base adaptor."})
@@ -37,11 +50,15 @@ class AdaptorRunArguments:
 
     @property
     def adaptor_config(self) -> AdaptorConfig:
+        decoder_config = Qwen3Config.from_json_file(self.adaptor_decoder_config_path)
+        if self.attn_implementation is not None:
+            decoder_config._attn_implementation = self.attn_implementation
+
         return AdaptorConfig(
             input_size=self.input_size,
             output_size=self.output_size,
-            intermediate_size=self.intermediate_size,
             output_timesteps=self.output_timesteps,
+            decoder_config=decoder_config,
         )
 
 
@@ -51,25 +68,36 @@ class Adaptor(nn.Module):
         self.config = config
         self.input_size = config.input_size
         self.output_size = config.output_size
-        self.intermediate_size = config.intermediate_size
         self.output_timesteps = config.output_timesteps
-        self.gate_proj = nn.Linear(self.input_size, self.intermediate_size, bias=False)
-        self.up_proj = nn.Linear(self.input_size, self.intermediate_size, bias=False)
-        self.down_proj = nn.Linear(self.intermediate_size, self.output_size * self.output_timesteps, bias=False)
-        self.act_fn = silu
+        self.decoder_config = config.decoder_config
+
+        self.input_proj = nn.Linear(self.input_size, self.decoder_config.hidden_size * self.output_timesteps, bias=False)
+        self.decoder = Qwen3Model(self.decoder_config)
+        self.output_proj = nn.Linear(self.decoder_config.hidden_size, self.output_size, bias=False)
 
     def forward(
         self,
         inputs: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        use_cache: Optional[bool] = None,
         targets: Optional[torch.Tensor] = None,
-        mask: Optional[torch.Tensor] = None,
+        output_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
-        down_proj: torch.Tensor = self.down_proj(self.act_fn(self.gate_proj(inputs)) * self.up_proj(inputs))
-        preds = down_proj.view(*inputs.shape[:-2], -1, self.output_size)
-        outputs = {"logits": preds}
+        inputs_embeds = self.input_proj(inputs).view(*inputs.shape[:-2], -1, self.decoder_config.hidden_size)
+        last_hidden_state: torch.Tensor = self.decoder(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        ).last_hidden_state
+        output_embeds = self.output_proj(last_hidden_state)
+        outputs = {"logits": output_embeds}
         if targets is not None:
-            assert mask is not None
-            outputs["loss"] = ((preds - targets).square() * mask).sum() / mask.sum().clamp_min(1.0)
+            assert output_mask is not None
+            outputs["loss"] = ((output_embeds - targets).square() * output_mask).sum() / output_mask.sum().clamp_min(1.0)
 
         return outputs
 
@@ -105,7 +133,7 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int) ->
     for b in batch:
         x: torch.Tensor = b["mimi_features"]
         y: torch.Tensor = b["qwen_omni_features"]
-        mask = torch.ones_like(y[:, :1])
+        output_mask = torch.ones_like(y[:, :1])
 
         max_pairs = min(x.shape[0], y.shape[0] // 2, max_input_seq_len)
         if max_pairs == 0:
@@ -113,24 +141,24 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int) ->
         elif x.shape[0] > max_input_seq_len:
             x = x[:max_input_seq_len]
             y = y[: 2 * max_input_seq_len]
-            mask = mask[: 2 * max_input_seq_len]
+            output_mask = output_mask[: 2 * max_input_seq_len]
         elif x.shape[0] < max_input_seq_len:
             x = F.pad(x, (0, 0, 0, max_input_seq_len - x.shape[0]), value=0)
             y = F.pad(y, (0, 0, 0, 2 * max_input_seq_len - y.shape[0]), value=0)
-            mask = F.pad(mask, (0, 0, 0, 2 * max_input_seq_len - mask.shape[0]), value=0)
+            output_mask = F.pad(output_mask, (0, 0, 0, 2 * max_input_seq_len - output_mask.shape[0]), value=0)
 
         assert x.shape[0] == max_input_seq_len
         assert y.shape[0] == 2 * max_input_seq_len
-        assert mask.shape[0] == 2 * max_input_seq_len
+        assert output_mask.shape[0] == 2 * max_input_seq_len
 
         inputs.append(x)
         targets.append(y)
-        masks.append(mask)
+        masks.append(output_mask)
 
     return {
         "inputs": torch.stack(inputs, dim=0),
         "targets": torch.stack(targets, dim=0),
-        "mask": torch.stack(masks, dim=0),
+        "output_mask": torch.stack(masks, dim=0),
     }
 
 
@@ -161,7 +189,7 @@ def parse_args() -> tuple[AdaptorRunArguments, TrainingArguments]:
     parser = HfArgumentParser((AdaptorRunArguments, TrainingArguments))  # type: ignore
     run_args, training_args = parser.parse_args_into_dataclasses()  # type: ignore
     training_args.remove_unused_columns = False
-    training_args.label_names = ["targets", "mask"]  # type: ignore
+    training_args.label_names = ["targets", "output_mask"]  # type: ignore
     return run_args, training_args
 
 

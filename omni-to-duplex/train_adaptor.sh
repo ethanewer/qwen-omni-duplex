@@ -21,12 +21,12 @@ uv run accelerate launch \
   --learning_rate 0.001 \
   --warmup_ratio 0.01 \
   --lr_scheduler_type cosine \
-  --per_device_train_batch_size 64 \
+  --per_device_train_batch_size 16 \
   --gradient_accumulation_steps 1 \
   --per_device_eval_batch_size 64 \
-  --eval_accumulation_steps 4 \
+  --eval_accumulation_steps 16 \
   --disable_tqdm False \
   --data_path ../../../../mnt/efs/fs1/extracted_audio_features/ \
   --final_filename final_adaptor.pt \
-  --max_eval_dataset_size 8192 \
+  --max_eval_dataset_size 4096 \
   $@
