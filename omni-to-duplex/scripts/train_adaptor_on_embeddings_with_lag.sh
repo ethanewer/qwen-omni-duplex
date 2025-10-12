@@ -1,7 +1,7 @@
 CUDA_VISIBLE_DEVICES=2,3 \
 uv run accelerate launch \
   --config_file configs/fsdp_config_2_gpu.yaml \
-  train/adaptor_embedding_sft.py \
+  train_adaptor_on_embeddings.py \
   --do_train True \
   --do_eval True \
   --num_train_epochs 1 \

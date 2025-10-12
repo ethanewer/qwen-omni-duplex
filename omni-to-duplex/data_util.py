@@ -11,7 +11,7 @@ import torch
 import torchaudio
 from moshi.models import MimiModel
 from qwen_omni_utils import process_mm_info
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
+from transformers.models.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
 
 @dataclass
@@ -107,7 +107,7 @@ def get_qwen_omni_features(
     param = next(iter(qwen_omni.parameters()))
     conversation = [{"role": "user", "content": [{"type": "audio", "audio": sample.audio}]}]
     audios, _, _ = process_mm_info(conversation, use_audio_in_video=True)  # type: ignore
-    inputs = processor(text="", audio=audios, return_tensors="pt", padding=True, use_audio_in_video=True)
+    inputs = processor(text="", audio=audios, return_tensors="pt", padding=True, use_audio_in_video=True)  # type: ignore
     inputs = inputs.to(param.device, param.dtype)
     with torch.no_grad():
         return qwen_omni.thinker.get_audio_features(inputs.input_features, inputs.feature_attention_mask)

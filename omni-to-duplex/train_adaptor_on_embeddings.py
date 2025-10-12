@@ -138,8 +138,8 @@ def compute_metrics(eval_pred):
     assert isinstance(preds, np.ndarray) and isinstance(targets, np.ndarray) and isinstance(output_mask, np.ndarray)
 
     if preds.shape[1] != targets.shape[1]:
-        targets = targets[:, -preds.shape[1] :]
-        output_mask = output_mask[:, -preds.shape[1] :]
+        targets = targets[:, : preds.shape[1]]
+        output_mask = output_mask[:, : preds.shape[1]]
 
     assert preds.shape == targets.shape and preds.shape[:2] == output_mask.shape[:2]
 

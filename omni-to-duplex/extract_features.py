@@ -6,7 +6,7 @@ import torch
 from huggingface_hub import hf_hub_download
 from moshi.models import MimiModel, loaders
 from tqdm import tqdm
-from transformers import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor  # type: ignore
+from transformers.models.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
 from data_util import get_quantized_mimi_features, get_qwen_omni_features, load_audio_samples
 
@@ -52,14 +52,15 @@ def process_tar(
                 "mimi_features": mimi_features[key],
                 "qwen_omni_features": qwen_omni_features[key],
                 "audio_src_id": samples[key].audio_src_id,
-            } for key in sorted(set(mimi_features.keys()) & set(qwen_omni_features.keys()))
+            }
+            for key in sorted(set(mimi_features.keys()) & set(qwen_omni_features.keys()))
         ],
     }
 
     torch.cuda.empty_cache()
     torch.save(results, out_tmp)
     os.replace(out_tmp, out_final)
-    print(f"Wrote {len(results["items"])} to {out_final}.")
+    print(f"Wrote {len(results['items'])} to {out_final}.")
 
 
 def parse_args() -> tuple[Path, Path]:
@@ -104,7 +105,7 @@ def main() -> None:
                 out_dir=out_dir,
                 mimi=mimi,
                 qwen_omni=qwen_omni,
-                processor=processor,
+                processor=processor,  # type: ignore
             )
         except Exception as e:
             print(f"ERROR processing {tar_path}: {e}", flush=True)
