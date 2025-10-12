@@ -1,4 +1,7 @@
 import gc
+import os
+import shutil
+import time
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -8,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.utils.data import IterableDataset
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
@@ -220,14 +224,33 @@ def main() -> None:
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
 
-    final_dir = Path(run_args.final_filename)
-    final_dir.mkdir(parents=True, exist_ok=True)
-    state = {k.replace("adaptor.", ""): v for k, v in model.state_dict().items() if k.startswith("adaptor.")}
-    torch.save(
-        {"adaptor_state_dict": state, "config": adaptor_config.__dict__},
-        final_dir / run_args.final_filename,
+    save_path = Path(run_args.final_filename)
+    save_path.parent.mkdir(parents=True, exist_ok=True)
+
+    state_dict, _ = get_state_dict(
+        trainer.model,  # type: ignore
+        trainer.optimizer,  # type: ignore
+        options=StateDictOptions(full_state_dict=True, cpu_offload=True),
     )
-    print(f"Training complete. Final adaptor saved to {final_dir / run_args.final_filename}.")
+
+    for _ in range(3):
+        if os.path.exists(save_path):
+            shutil.rmtree(save_path, ignore_errors=True)
+
+        time.sleep(1)
+
+        try:
+            trainer.model.module.save_pretrained(  # type: ignore
+                save_path,
+                state_dict=state_dict,
+                safe_serialization=True,
+            )
+            break
+        except Exception as e:
+            print(f"Save failed due to the following exception: {e}")
+            time.sleep(1)
+
+    print(f"Training complete. Final adaptor saved to `{str(save_path)}`.")
 
 
 if __name__ == "__main__":
