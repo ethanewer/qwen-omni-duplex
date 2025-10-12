@@ -196,7 +196,7 @@ def compute_metrics(eval_pred):
         targets = targets[:, -preds.shape[1] :]
         output_mask = output_mask[:, -preds.shape[1] :]
 
-    assert preds.shape == targets.shape and preds.shape == output_mask.shape
+    assert preds.shape == targets.shape and preds.shape[:2] == output_mask.shape[:2]
 
     count = max(output_mask.sum(), 1)
     mse = (np.square(preds - targets) * output_mask).sum() / count
