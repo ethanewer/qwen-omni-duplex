@@ -1,11 +1,12 @@
 from typing import Optional
 
 import torch
+from huggingface_hub import hf_hub_download
+from moshi.models import loaders
 from torch import nn
 from transformers.cache_utils import Cache
 from transformers.configuration_utils import PretrainedConfig
-
-# from transformers.models.qwen2_5_omni import Qwen2_5OmniThinkerConfig, Qwen2_5OmniThinkerForConditionalGeneration
+from transformers.models.qwen2_5_omni import Qwen2_5OmniThinkerConfig, Qwen2_5OmniThinkerForConditionalGeneration
 from transformers.models.qwen3 import Qwen3Config, Qwen3Model
 
 
@@ -64,45 +65,33 @@ class Adaptor(nn.Module):
         return outputs
 
 
-# class QwenOmniWithMimiAudioForConditionalGeneration(Qwen2_5OmniThinkerForConditionalGeneration):
-#     def __init__(self, config: Qwen2_5OmniThinkerConfig, audio_adaptor_config: AdaptorConfig) -> None:
-#         super().__init__(config)
+class QwenOmniThinkerWithMimiAdaptor(Qwen2_5OmniThinkerForConditionalGeneration):
+    def __init__(self, config: Qwen2_5OmniThinkerConfig, audio_adaptor_config: AdaptorConfig) -> None:
+        super().__init__(config)
+        self.mimi = loaders.get_mimi(hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME), num_codebooks=8)
+        self.adaptor = Adaptor(audio_adaptor_config)
+        assert self.adaptor.lag_timesteps == 0
+        del self.audio_tower
 
-#     def get_audio_features(
-#         self,
-#         input_features: torch.Tensor,
-#         feature_attention_mask: Optional[torch.Tensor] = None,
-#         audio_feature_lengths: Optional[torch.Tensor] = None,
-#     ):
-#         """
-#         Encodes audios into continuous embeddings that can be forwarded to the language model.
+    def get_audio_features(
+        self,
+        input_features: torch.Tensor,
+        feature_attention_mask: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        mimi_latent_features = self.mimi.decode_latent(input_features.transpose(1, 2)).transpose(1, 2)
+        adaptor_outputs = self.adaptor(inputs=mimi_latent_features, attention_mask=feature_attention_mask)
+        return adaptor_outputs["logits"]
 
-#         Args:
-#             input_features (`torch.FloatTensor`):
-#                 The tensors corresponding to the input audios.
-#             feature_attention_mask (`torch.LongTensor`, *optional*):
-#                 Mask to avoid performing attention on padding feature indices. Mask values selected in `[0, 1]`:
-#             audio_feature_lengths (`torch.LongTensor` of shape `(num_audios)`, *optional*):
-#                 The length of feature shape of each audio in LLM.
-#         """
-#         if feature_attention_mask is not None:
-#             audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-#             input_features = input_features.permute(0, 2, 1)[feature_attention_mask.bool()].permute(1, 0)
-#         else:
-#             audio_feature_lengths = None
 
-#         audio_feat_lengths, audio_output_lengths = self.audio_tower._get_feat_extract_output_lengths(
-#             audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
-#         )
-#         feature_lens = audio_feature_lengths if audio_feature_lengths is not None else feature_attention_mask.sum(-1)
-#         audio_outputs = self.audio_tower(
-#             input_features,
-#             feature_lens=feature_lens,
-#             aftercnn_lens=audio_feat_lengths,
-#         )
-#         audio_features = audio_outputs.last_hidden_state
-
-#         if audio_features.shape[0] != sum(audio_output_lengths.tolist()):
-#             raise ValueError("length of audio_features should match audio_output_lengths")
-
-#         return audio_features
+def update_qwen2_5_omni_with_adaptor(
+    model: Qwen2_5OmniThinkerForConditionalGeneration,
+    adaptor: Adaptor,
+) -> QwenOmniThinkerWithMimiAdaptor:
+    assert adaptor.lag_timesteps == 0
+    model.mimi = loaders.get_mimi(hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME), num_codebooks=8)
+    model.adaptor = adaptor
+    del model.audio_tower
+    model.get_audio_features = QwenOmniThinkerWithMimiAdaptor.get_audio_features.__get__(model, type(model))
+    return model  # type: ignore

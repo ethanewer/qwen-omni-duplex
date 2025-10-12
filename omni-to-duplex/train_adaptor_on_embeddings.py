@@ -201,11 +201,7 @@ def main() -> None:
         time.sleep(1)
 
         try:
-            trainer.model.module.save_pretrained(  # type: ignore
-                save_path,
-                state_dict=state_dict,
-                safe_serialization=True,
-            )
+            torch.save(state_dict, save_path)
             break
         except Exception as e:
             print(f"Save failed due to the following exception: {e}")
