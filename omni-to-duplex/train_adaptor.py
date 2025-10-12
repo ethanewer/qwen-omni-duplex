@@ -29,7 +29,8 @@ def debug_xml(obj, name: str) -> None:
 class AdaptorConfig(PretrainedConfig):
     input_size: int
     output_size: int
-    output_timesteps: int
+    output_time_scale: int
+    lag_timesteps: int
     decoder_config: Qwen3Config
 
 
@@ -38,7 +39,8 @@ class AdaptorRunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
     input_size: int = field(default=512, metadata={"help": "Adaptor input feature size."})
     output_size: int = field(default=2048, metadata={"help": "Adaptor output feature size."})
-    output_timesteps: int = field(default=2, metadata={"help": "Timesteps produced per input step."})
+    output_time_scale: int = field(default=2, metadata={"help": "Timesteps produced per input step."})
+    lag_timesteps: int = field(default=0, metadata={"help": "Timestep lag between outputs and targets for loss calculation."})
     adaptor_decoder_config_path: str = field(
         default="configs/adaptor_decoder_config.json",
         metadata={"help": "Path to a Qwen3Model config."},
@@ -61,7 +63,8 @@ class AdaptorRunArguments:
         return AdaptorConfig(
             input_size=self.input_size,
             output_size=self.output_size,
-            output_timesteps=self.output_timesteps,
+            output_time_scale=self.output_time_scale,
+            lag_timesteps=self.lag_timesteps,
             decoder_config=decoder_config,
         )
 
@@ -72,10 +75,11 @@ class Adaptor(nn.Module):
         self.config = config
         self.input_size = config.input_size
         self.output_size = config.output_size
-        self.output_timesteps = config.output_timesteps
+        self.output_time_scale = config.output_time_scale
+        self.lag_timesteps = config.lag_timesteps
         self.decoder_config = config.decoder_config
 
-        self.input_proj = nn.Linear(self.input_size, self.decoder_config.hidden_size * self.output_timesteps, bias=False)
+        self.input_proj = nn.Linear(self.input_size, self.decoder_config.hidden_size * self.output_time_scale, bias=False)
         self.decoder = Qwen3Model(self.decoder_config)
         self.output_proj = nn.Linear(self.decoder_config.hidden_size, self.output_size, bias=False)
 
@@ -90,17 +94,23 @@ class Adaptor(nn.Module):
         output_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         inputs_embeds = self.input_proj(inputs).view(*inputs.shape[:-2], -1, self.decoder_config.hidden_size)
-        last_hidden_state: torch.Tensor = self.decoder(
+        last_hidden_state = self.decoder(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
         ).last_hidden_state
-        output_embeds = self.output_proj(last_hidden_state)
+        output_embeds: torch.Tensor = self.output_proj(last_hidden_state)
+
+        if self.lag_timesteps > 0:
+            output_embeds = output_embeds[:, self.lag_timesteps :]
+            if targets is not None and output_mask is not None:
+                targets = targets[:, : -self.lag_timesteps]
+                output_mask = output_mask[:, : -self.lag_timesteps]
+
         outputs = {"logits": output_embeds}
-        if targets is not None:
-            assert output_mask is not None
+        if targets is not None and output_mask is not None:
             outputs["loss"] = ((output_embeds - targets).square() * output_mask).sum() / output_mask.sum().clamp_min(1.0)
 
         return outputs
