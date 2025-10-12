@@ -180,22 +180,28 @@ def compute_metrics(eval_pred):
     preds = eval_pred.predictions
 
     if isinstance(eval_pred.label_ids, (tuple, list)):
-        targets, mask = eval_pred.label_ids
+        targets, output_mask = eval_pred.label_ids
     else:
         targets = eval_pred.label_ids
-        mask = None
+        output_mask = None
 
-    if mask is not None:
-        assert isinstance(mask, np.ndarray)
+    if output_mask is not None:
+        assert isinstance(output_mask, np.ndarray)
     else:
-        mask = np.ones_like(targets[:, :, :1])
+        output_mask = np.ones_like(targets[:, :, :1])
 
-    assert isinstance(preds, np.ndarray) and isinstance(targets, np.ndarray) and isinstance(mask, np.ndarray)
+    assert isinstance(preds, np.ndarray) and isinstance(targets, np.ndarray) and isinstance(output_mask, np.ndarray)
 
-    count = max(mask.sum(), 1)
-    mse = (np.square(preds - targets) * mask).sum() / count
-    mean = (targets * mask).sum(axis=(0, 1)) / count
-    var = (np.square(targets - mean) * mask).sum() / count
+    if preds.shape[1] != targets.shape[1]:
+        targets = targets[:, -preds.shape[1] :]
+        output_mask = output_mask[:, -preds.shape[1] :]
+
+    assert preds.shape == targets.shape and preds.shape == output_mask.shape
+
+    count = max(output_mask.sum(), 1)
+    mse = (np.square(preds - targets) * output_mask).sum() / count
+    mean = (targets * output_mask).sum(axis=(0, 1)) / count
+    var = (np.square(targets - mean) * output_mask).sum() / count
     return {"r2": 1 - mse / var}
 
 
