@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Optional
 
 import torch
@@ -95,3 +96,34 @@ def update_qwen2_5_omni_with_adaptor(
     del model.audio_tower
     model.get_audio_features = QwenOmniThinkerWithMimiAdaptor.get_audio_features.__get__(model, type(model))
     return model  # type: ignore
+
+
+def load_qwen_omni_thinker_with_mimi_adaptor(
+    model_name_or_path: str | Path,
+    adaptor_config_path: str | Path,
+    adaptor_state_dict_path: Optional[str | Path] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    attn_implementation: str = "sdpa",
+    unfreeze_modules: list[str] = ["model", "adaptor"],
+) -> QwenOmniThinkerWithMimiAdaptor:
+    model = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+        model_name_or_path,
+        torch_dtype=dtype,
+        attn_implementation=attn_implementation,
+    )
+    adaptor_config: AdaptorConfig = AdaptorConfig.from_json_file(adaptor_config_path)  # type: ignore
+    adaptor_config.decoder_config = Qwen3Config(**adaptor_config.decoder_config)  # type: ignore
+    adaptor_config.decoder_config._attn_implementation = attn_implementation
+    adaptor = Adaptor(adaptor_config)
+    if adaptor_state_dict_path is not None:
+        adaptor.load_state_dict(torch.load(adaptor_state_dict_path, map_location="cpu"))
+
+    model = update_qwen2_5_omni_with_adaptor(model, adaptor)
+
+    for name, param in model.named_parameters():
+        if any(name.startswith(module) for module in unfreeze_modules):
+            param.requires_grad = True
+        else:
+            param.requires_grad = False
+
+    return model.to(dtype)  # type: ignore
