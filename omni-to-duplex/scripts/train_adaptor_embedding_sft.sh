@@ -1,7 +1,7 @@
-CUDA_VISIBLE_DEVICES=2,3 \
+CUDA_VISIBLE_DEVICES=4,5,6,7 \
 uv run accelerate launch \
-  --config_file configs/fsdp_config_2_gpu.yaml \
-  train_adaptor.py \
+  --config_file configs/fsdp_config_4_gpu.yaml \
+  train/adaptor_embedding_sft.py \
   --do_train True \
   --do_eval True \
   --num_train_epochs 1 \
@@ -20,11 +20,10 @@ uv run accelerate launch \
   --warmup_ratio 0.01 \
   --lr_scheduler_type cosine \
   --per_device_train_batch_size 32 \
-  --gradient_accumulation_steps 2 \
+  --gradient_accumulation_steps 1 \
   --per_device_eval_batch_size 64 \
   --eval_accumulation_steps 16 \
   --disable_tqdm False \
   --data_path ../../../../mnt/efs/fs1/extracted_audio_features/ \
   --final_filename final_adaptor.pt \
-  --max_eval_dataset_size 4096 \
-  --lag_timesteps 2
+  --max_eval_dataset_size 4096
