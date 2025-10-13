@@ -27,7 +27,7 @@ def debug_xml(obj, name: str) -> None:
 
 
 @dataclass
-class AdaptorRunArguments:
+class RunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
     input_size: int = field(default=512, metadata={"help": "MimiToQwenOmniAdaptor input feature size."})
     output_size: int = field(default=2048, metadata={"help": "MimiToQwenOmniAdaptor output feature size."})
@@ -150,8 +150,8 @@ def compute_metrics(eval_pred):
     return {"r2": 1 - mse / var}
 
 
-def parse_args() -> tuple[AdaptorRunArguments, TrainingArguments]:
-    parser = HfArgumentParser((AdaptorRunArguments, TrainingArguments))  # type: ignore
+def parse_args() -> tuple[RunArguments, TrainingArguments]:
+    parser = HfArgumentParser((RunArguments, TrainingArguments))  # type: ignore
     run_args, training_args = parser.parse_args_into_dataclasses()  # type: ignore
     training_args.remove_unused_columns = False
     training_args.label_names = ["targets", "output_mask"]  # type: ignore
