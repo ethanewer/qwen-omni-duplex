@@ -575,7 +575,7 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
         self.text_vocab_size = text_model.config.vocab_size
         assert self.text_vocab_size == thinker.lm_head.out_features
         self.lm_head = nn.Linear(
-            in_features=thinker.config.hidden_size,
+            in_features=thinker.lm_head.in_features,
             out_features=self.text_vocab_size + mimi.config.codebook_size,
             bias=False,
             dtype=dtype,
@@ -588,10 +588,53 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             self.code_predictor.load_state_dict(torch.load(code_predictor_state_dict_path, map_location="cpu"))
 
         self.proj_code = nn.Linear(
-            in_features=thinker.config.hidden_size,
+            in_features=thinker.lm_head.in_features,
             out_features=code_predictor_config.hidden_size,
             bias=False,
             dtype=dtype,
+        )
+
+    def compute_code_predictor_loss(
+        self,
+        input_ids: torch.Tensor,
+        last_hidden_state: torch.Tensor,
+        audio_codes: torch.Tensor,
+        audio_labels: torch.Tensor,
+        audio_codes_mask: Optional[torch.Tensor] = None,
+    ):
+        hidden_embeds = last_hidden_state[(input_ids == self.model.audio_token_id) | (input_ids >= self.text_vocab_size)]
+        if self.model.adaptor.output_time_scale > 1:
+            hidden_embeds = hidden_embeds[self.model.adaptor.output_time_scale - 1 :: self.model.adaptor.output_time_scale]
+
+        hidden_embeds = self.proj_code(hidden_embeds)
+
+        if audio_codes_mask is None:
+            audio_codes = audio_codes.view(audio_codes.shape[0] * audio_codes.shape[1], -1)
+            audio_labels = audio_labels.view(audio_codes.shape[0] * audio_codes.shape[1], -1)
+        else:
+            audio_codes = audio_codes[audio_codes_mask == 1]
+            audio_labels = audio_labels[audio_codes_mask == 1]
+
+        assert hidden_embeds.shape[0] == audio_codes.shape[0]
+
+        audio_code_embeds = [
+            self.code_predictor.get_input_embeddings()[i](audio_codes[:, [i]])
+            for i in range(self.code_predictor.config.num_code_groups - 1)
+        ]
+
+        code_predictor_embeds = torch.cat([hidden_embeds[:, None]] + audio_code_embeds, dim=1)
+        code_predictor_last_hidden_state = self.code_predictor.model(inputs_embeds=code_predictor_embeds).last_hidden_state
+        logits = torch.cat(
+            [
+                self.code_predictor.lm_head[i](code_predictor_last_hidden_state[:, [i + 1]])
+                for i in range(self.code_predictor.config.num_code_groups - 1)
+            ],
+            dim=1,
+        )
+        return self.code_predictor.loss_function(
+            logits=logits,
+            labels=audio_labels[:, 1:],
+            vocab_size=self.model.mimi.config.codebook_size,
         )
 
     def forward(
@@ -606,6 +649,7 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
         inputs_embeds: Optional[torch.Tensor] = None,
         rope_deltas: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        audio_labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
@@ -628,28 +672,38 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
 
         logits = self.lm_head(outputs.last_hidden_state)
 
-        if input_ids is not None and audio_codes is not None:
-            audio_hidden_states = outputs.last_hidden_state[
-                (input_ids == self.audio_token_id) | (input_ids >= self.text_vocab_size)
-            ]
-            if audio_codes_mask is None:
-                audio_codes = audio_codes.view(audio_codes.shape[0] * audio_codes.shape[1], -1)
-            else:
-                audio_codes = audio_codes[audio_codes_mask == 1]
-
-            assert audio_hidden_states.shape[0] == audio_codes.shape[0]
-
         if labels is not None:
-            loss = self.model.text_model.loss_function(
+            lm_loss = self.model.text_model.loss_function(
                 logits=logits,
                 labels=labels,
-                vocab_size=self.model.text_model.config.get_text_config().vocab_size,
+                vocab_size=self.text_vocab_size + self.model.mimi.config.codebook_size,
             )
+        else:
+            lm_loss = None
+
+        if input_ids is not None and audio_codes is not None and audio_labels is not None:
+            code_predictor_loss = self.compute_code_predictor_loss(
+                last_hidden_state=outputs.last_hidden_state,
+                input_ids=input_ids,
+                audio_codes=audio_codes,
+                audio_labels=audio_labels,
+                audio_codes_mask=audio_codes_mask,
+            )
+        else:
+            code_predictor_loss = None
+
+        if lm_loss is not None and code_predictor_loss is not None:
+            loss = lm_loss + code_predictor_loss
+        elif lm_loss is not None:
+            loss = lm_loss
+        elif code_predictor_loss is not None:
+            loss = code_predictor_loss
         else:
             loss = None
 
         return QwenOmniWithMimiOutputWithPast(
             loss=loss,
+            last_hidden_state=outputs.last_hidden_state,
             logits=logits,
             past_key_values=outputs.past_key_values,
             audio_past_key_values=outputs.audio_past_key_values,
