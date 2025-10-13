@@ -15,7 +15,7 @@ from transformers.models.qwen3 import Qwen3Config, Qwen3Model
 from transformers.utils.generic import ModelOutput
 
 
-class MimiToQwenOmniAdaptorConfig(PretrainedConfig):
+class MimiToQwenOmniAdaptorConfig(PretrainedConfig):  # type: ignore
     input_size: int
     output_size: int
     output_time_scale: int
@@ -83,7 +83,7 @@ class MimiToQwenOmniAdaptor(nn.Module):
 
 
 @dataclass
-class QwenOmniWithMimiOutputWithPast(ModelOutput):
+class Qwen2_5OmniWithMimiOutputWithPast(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     past_key_values: Optional[Cache] = None
@@ -91,7 +91,7 @@ class QwenOmniWithMimiOutputWithPast(ModelOutput):
     rope_deltas: Optional[torch.Tensor] = None
 
 
-class QwenOmniWithMimiForConditionalGeneration(nn.Module):
+class Qwen2_5OmniWithMimiForConditionalGeneration(nn.Module):
     def __init__(
         self,
         text_model_name_or_path: str | Path,
@@ -111,16 +111,16 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             adaptor_config.decoder_config = Qwen3Config(**adaptor_config.decoder_config)  # type: ignore
             adaptor_config.decoder_config._attn_implementation = attn_implementation
 
-        self.mimi: MimiModel = MimiModel.from_pretrained(
+        self.mimi = MimiModel.from_pretrained(
             mimi_model_name_or_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             attn_implementation=attn_implementation,
         )
         self.adaptor = MimiToQwenOmniAdaptor(adaptor_config).to(dtype)
         self.text_tokenizer = AutoTokenizer.from_pretrained(text_model_name_or_path)
         thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
             text_model_name_or_path,
-            torch_dtype=dtype,
+            dtype=dtype,
             attn_implementation=attn_implementation,
         )
         self.model = thinker.model
@@ -187,7 +187,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         audio_use_cache: Optional[bool] = None,
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> QwenOmniWithMimiOutputWithPast:
+    ) -> Qwen2_5OmniWithMimiOutputWithPast:
         return_dict = return_dict if return_dict is not None else self.model.config.use_return_dict
 
         if inputs_embeds is None:
@@ -252,7 +252,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             output = (logits,) + outputs
             return (loss,) + output if loss is not None else output
 
-        return QwenOmniWithMimiOutputWithPast(
+        return Qwen2_5OmniWithMimiOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -306,6 +306,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         text: str,
         audio: Optional[torch.Tensor | np.ndarray] = None,
         audio_sample_rate: Optional[int] = None,
+        num_audio_quantizers: int = 8,
     ) -> BatchFeature | BatchEncoding:
         if audio is not None:
             if isinstance(audio, np.ndarray):
@@ -322,7 +323,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
                 audio = audio[None]
 
             mimi_param = next(iter(self.mimi.parameters()))
-            mimi_outputs = self.mimi.encode(audio.to(mimi_param.device, mimi_param.dtype))
+            mimi_outputs = self.mimi.encode(audio.to(mimi_param.device, mimi_param.dtype), num_quantizers=num_audio_quantizers)
             assert isinstance(mimi_outputs, MimiEncoderOutput) and mimi_outputs.audio_codes is not None
             audio_codes = mimi_outputs.audio_codes.transpose(1, 2)
         else:

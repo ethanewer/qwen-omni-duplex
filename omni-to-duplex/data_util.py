@@ -10,8 +10,13 @@ import soundfile as sf
 import torch
 import torchaudio
 from qwen_omni_utils import process_mm_info
+from transformers import (
+    Qwen2_5OmniForConditionalGeneration,
+    Qwen2_5OmniProcessor,
+    Qwen3OmniMoeForConditionalGeneration,
+    Qwen3OmniMoeProcessor,
+)
 from transformers.models.mimi.modeling_mimi import MimiEncoderOutput, MimiModel
-from transformers.models.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
 
 @dataclass
@@ -97,29 +102,21 @@ def get_quantized_mimi_features(mimi: MimiModel, sample: AudioSample) -> torch.T
     while audio.ndim < 3:
         audio = audio[None]
 
-    mimi_outputs = mimi.encode(audio.to(mimi_param.device, mimi_param.dtype))
+    mimi_outputs = mimi.encode(audio.to(mimi_param.device, mimi_param.dtype), num_quantizers=8)
     assert isinstance(mimi_outputs, MimiEncoderOutput) and mimi_outputs.audio_codes is not None
-    audio_codes = mimi_outputs.audio_codes.transpose(1, 2)
+    audio_codes = mimi_outputs.audio_codes
     return mimi.quantizer.decode(audio_codes)[0].T
 
 
 @torch.inference_mode()
-def get_qwen2_5_omni_features(
-    qwen_omni: Qwen2_5OmniForConditionalGeneration,
-    processor: Qwen2_5OmniProcessor,
+def get_qwen_omni_features(
+    qwen_omni: Qwen2_5OmniForConditionalGeneration | Qwen3OmniMoeForConditionalGeneration,
+    processor: Qwen2_5OmniProcessor | Qwen3OmniMoeProcessor,
     sample: AudioSample,
 ) -> torch.Tensor:
-    param = next(iter(qwen_omni.parameters()))
+    qwen_omni_param = next(iter(qwen_omni.parameters()))
     conversation = [{"role": "user", "content": [{"type": "audio", "audio": sample.audio}]}]
     audios, _, _ = process_mm_info(conversation, use_audio_in_video=True)  # type: ignore
     inputs = processor(text="", audio=audios, return_tensors="pt", padding=True, use_audio_in_video=True)  # type: ignore
-    inputs = inputs.to(param.device, param.dtype)
+    inputs = inputs.to(qwen_omni_param.device, qwen_omni_param.dtype)
     return qwen_omni.thinker.get_audio_features(inputs.input_features, inputs.feature_attention_mask)
-
-
-@torch.inference_mode()
-def get_qwen3_omni_features(
-    qwen_omni: Qwen2_5OmniForConditionalGeneration,
-    processor: Qwen2_5OmniProcessor,
-    sample: AudioSample,
-) -> torch.Tensor: ...
