@@ -461,7 +461,6 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             return sequences
 
 
-# TODO: Make this class
 class QwenOmniWithMimiAudioOutput(nn.Module):
     def __init__(
         self,
