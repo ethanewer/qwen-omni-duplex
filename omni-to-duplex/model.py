@@ -127,7 +127,6 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         self.audio_token_id: int = thinker.config.audio_token_id
         # TODO: update to support image/video inputs
         del thinker
-        assert self.adaptor.lag_timesteps == 0
 
         if adaptor_state_dict_path is not None:
             self.adaptor.load_state_dict(torch.load(adaptor_state_dict_path, map_location="cpu"))
@@ -155,7 +154,6 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         audio_past_key_values: Optional[Cache] = None,
         audio_use_cache: Optional[bool] = None,
     ) -> MimiToQwenOmniAdaptorOutputWithPast:
-        # print("processing audio")
         mimi_latent_features = self.mimi.decode_latent(audio_codes.transpose(1, 2)).transpose(1, 2)
         return self.adaptor(
             inputs=mimi_latent_features,
@@ -227,7 +225,6 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
                 position_ids = position_ids.add(delta)
                 position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
 
-        # print(f"{inputs_embeds.shape=}")
         outputs = self.model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -273,7 +270,9 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             if audio_attention_mask is not None:
                 audio_lengths = iter(audio_attention_mask.sum(dim=1))
             else:
-                audio_lengths = iter([2 * audio_codes.shape[1]])
+                output_time_scale = self.adaptor.output_time_scale
+                lag_timesteps = self.adaptor.lag_timesteps
+                audio_lengths = iter([output_time_scale * audio_codes.shape[1] - lag_timesteps])
         else:
             audio_lengths = iter([])
 
@@ -338,17 +337,12 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         past_key_values = DynamicCache()
         outputs = self(**inputs, past_key_values=past_key_values, use_cache=True)
 
-        sequences = inputs.input_ids
         input_ids = outputs.logits[:, -1:].argmax(dim=-1)
         attention_mask = F.pad(inputs.attention_mask, (0, 1), value=1)
+        sequences = torch.cat((inputs.input_ids, input_ids), dim=1)
 
         for _ in range(max_new_tokens - 1):
-            # print(f"{input_ids.shape=}")
-            # print(f"{attention_mask.shape=}")
-            # print(f"{past_key_values.key_cache[0].shape=}")
-            # print(f"{past_key_values.value_cache[0].shape=}")
             position_ids = attention_mask.sum(dim=1, keepdim=True)
-            # print(f"{position_ids=}")
             outputs = self(
                 input_ids=input_ids,
                 position_ids=position_ids,
