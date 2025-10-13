@@ -84,7 +84,7 @@ class FeatureShardIterableDataset(IterableDataset):
             gc.collect()
 
 
-def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int) -> dict[str, Any]:
+def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int, output_time_scale: int) -> dict[str, Any]:
     inputs: list[torch.Tensor] = []
     targets: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
@@ -94,21 +94,21 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int) ->
         y: torch.Tensor = b["qwen_omni_features"]
         output_mask = torch.ones_like(y[:, :1])
 
-        max_pairs = min(x.shape[0], y.shape[0] // 2, max_input_seq_len)
+        max_pairs = min(x.shape[0], y.shape[0] // output_time_scale, max_input_seq_len)
         if max_pairs == 0:
             continue
         elif x.shape[0] > max_input_seq_len:
             x = x[:max_input_seq_len]
-            y = y[: 2 * max_input_seq_len]
-            output_mask = output_mask[: 2 * max_input_seq_len]
+            y = y[: output_time_scale * max_input_seq_len]
+            output_mask = output_mask[: output_time_scale * max_input_seq_len]
         elif x.shape[0] < max_input_seq_len:
             x = F.pad(x, (0, 0, 0, max_input_seq_len - x.shape[0]), value=0)
-            y = F.pad(y, (0, 0, 0, 2 * max_input_seq_len - y.shape[0]), value=0)
-            output_mask = F.pad(output_mask, (0, 0, 0, 2 * max_input_seq_len - output_mask.shape[0]), value=0)
+            y = F.pad(y, (0, 0, 0, output_time_scale * max_input_seq_len - y.shape[0]), value=0)
+            output_mask = F.pad(output_mask, (0, 0, 0, output_time_scale * max_input_seq_len - output_mask.shape[0]), value=0)
 
         assert x.shape[0] == max_input_seq_len
-        assert y.shape[0] == 2 * max_input_seq_len
-        assert output_mask.shape[0] == 2 * max_input_seq_len
+        assert y.shape[0] == output_time_scale * max_input_seq_len
+        assert output_mask.shape[0] == output_time_scale * max_input_seq_len
 
         inputs.append(x)
         targets.append(y)
@@ -180,7 +180,11 @@ def main() -> None:
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         compute_metrics=compute_metrics,
-        data_collator=partial(collate_fn_alignment, max_input_seq_len=run_args.max_input_seq_len),
+        data_collator=partial(
+            collate_fn_alignment,
+            max_input_seq_len=run_args.max_input_seq_len,
+            output_time_scale=run_args.output_time_scale,
+        ),
     )
 
     trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
