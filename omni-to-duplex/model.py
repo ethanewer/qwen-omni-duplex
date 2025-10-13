@@ -633,7 +633,7 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
         )
         return self.code_predictor.loss_function(
             logits=logits,
-            labels=audio_labels[:, 1:],
+            shift_labels=audio_labels[:, 1:],
             vocab_size=self.model.mimi.config.codebook_size,
         )
 
