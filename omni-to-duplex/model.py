@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 import torchaudio.functional
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 from transformers import (
     AutoTokenizer,
     BatchEncoding,
@@ -19,10 +20,12 @@ from transformers import (
     Qwen2_5OmniThinkerTextModel,
     Qwen3Config,
     Qwen3Model,
+    Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration,
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextModel,
 )
 from transformers.models.mimi.modeling_mimi import MimiEncoderOutput, MimiModel
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerCodePredictorConfig
 from transformers.utils.generic import ModelOutput
 
 
@@ -66,6 +69,14 @@ class MimiToQwenOmniAdaptor(nn.Module):
         output_mask: Optional[torch.Tensor] = None,
     ) -> dict[str, torch.Tensor]:
         inputs_embeds = self.input_proj(inputs).view(*inputs.shape[:-2], -1, self.decoder_config.hidden_size)
+        if self.output_time_scale > 1 and attention_mask is not None:
+            batch_size, input_seq_len = attention_mask.shape
+            attention_mask = (
+                attention_mask[:, :, None]
+                .expand(batch_size, input_seq_len, self.output_time_scale)
+                .reshape(batch_size, input_seq_len * self.output_time_scale)
+            )
+
         decoder_outputs = self.decoder(
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
@@ -122,14 +133,14 @@ class QwenOmniWithMimi(nn.Module):
     def get_audio_features(
         self,
         audio_codes: torch.Tensor,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         audio_past_key_values: Optional[Cache] = None,
         audio_use_cache: Optional[bool] = None,
     ) -> MimiToQwenOmniAdaptorOutputWithPast:
         mimi_latent_features = self.mimi.quantizer.decode(audio_codes.transpose(1, 2)).transpose(1, 2)
         return self.adaptor(
             inputs=mimi_latent_features,
-            attention_mask=audio_attention_mask,
+            attention_mask=audio_codes_mask,
             past_key_values=audio_past_key_values,
             use_cache=audio_use_cache,
         )
@@ -147,7 +158,7 @@ class QwenOmniWithMimi(nn.Module):
         input_ids: Optional[torch.Tensor] = None,
         audio_codes: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         audio_past_key_values: Optional[Cache] = None,
@@ -167,13 +178,15 @@ class QwenOmniWithMimi(nn.Module):
             if audio_codes is not None:
                 audio_outputs = self.get_audio_features(
                     audio_codes=audio_codes,
-                    audio_attention_mask=audio_attention_mask,
+                    audio_codes_mask=audio_codes_mask,
                     audio_past_key_values=audio_past_key_values,
                     audio_use_cache=audio_use_cache,
                 )
                 audio_features = audio_outputs.logits
                 assert audio_features is not None
-                audio_mask = (input_ids == self.audio_token_id).unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
+
+                audio_mask = (input_ids == self.audio_token_id) | (input_ids >= self.text_model.config.vocab_size)
+                audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
 
@@ -214,15 +227,16 @@ class QwenOmniWithMimi(nn.Module):
         self,
         text: str | list[str],
         audio_codes: Optional[torch.Tensor] = None,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         audio_token: str = "<|AUDIO|>",
+        **tokenizer_kwargs,
     ) -> BatchFeature | BatchEncoding:
         if audio_codes is not None:
-            if audio_attention_mask is not None:
-                audio_lengths = iter(audio_attention_mask.sum(dim=1))
+            output_time_scale = self.adaptor.output_time_scale
+            lag_timesteps = self.adaptor.lag_timesteps
+            if audio_codes_mask is not None:
+                audio_lengths = iter(output_time_scale * audio_codes_mask.sum(dim=1) - lag_timesteps)
             else:
-                output_time_scale = self.adaptor.output_time_scale
-                lag_timesteps = self.adaptor.lag_timesteps
                 audio_lengths = iter([output_time_scale * audio_codes.shape[1] - lag_timesteps])
         else:
             audio_lengths = iter([])
@@ -246,40 +260,61 @@ class QwenOmniWithMimi(nn.Module):
             sample = sample.replace("<|audio_placeholder|>", audio_token)
             processed_text.append(sample)
 
-        processed_inputs = self.text_tokenizer(processed_text, return_tensors="pt")
+        processed_inputs = self.text_tokenizer(processed_text, return_tensors="pt", **tokenizer_kwargs)
         processed_inputs["audio_codes"] = audio_codes
-        processed_inputs["audio_attention_mask"] = audio_attention_mask
+        processed_inputs["audio_codes_mask"] = audio_codes_mask
         return processed_inputs
 
     def process_inputs(
         self,
-        text: str,
-        audio: Optional[torch.Tensor | np.ndarray] = None,
-        audio_sample_rate: Optional[int] = None,
+        text: str | list[str],
+        audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
+        audio_sample_rate: Optional[int | list[int]] = None,
         num_audio_quantizers: int = 8,
+        **tokenizer_kwargs,
     ) -> BatchFeature | BatchEncoding:
+        if not isinstance(text, list):
+            text = [text]
+
         if audio is not None:
-            if isinstance(audio, np.ndarray):
-                audio = torch.from_numpy(audio).float()
+            if not isinstance(audio, list):
+                audio = [audio]
 
-            if audio_sample_rate is not None and audio_sample_rate != self.mimi.config.sampling_rate:
-                audio = torchaudio.functional.resample(
-                    audio,
-                    orig_freq=audio_sample_rate,
-                    new_freq=self.mimi.config.sampling_rate,
-                )
+            if audio_sample_rate is not None:
+                if isinstance(audio_sample_rate, int):
+                    audio_sample_rate = [audio_sample_rate] * len(audio)
 
-            while audio.ndim < 3:
-                audio = audio[None]
+                assert len(audio) == len(audio_sample_rate)
+                for i in range(len(audio)):
+                    if audio_sample_rate[i] != self.mimi.config.sampling_rate:
+                        audio[i] = torchaudio.functional.resample(
+                            audio[i],
+                            orig_freq=audio_sample_rate[i],
+                            new_freq=self.mimi.config.sampling_rate,
+                        )
+
+            audio_mask = pad_sequence(
+                [torch.ones(a.shape, dtype=torch.long, device=a.device) for a in audio],
+                batch_first=True,
+            )
+            audio = pad_sequence(audio, batch_first=True)
+            assert audio.ndim == 2
 
             mimi_param = next(iter(self.mimi.parameters()))
-            mimi_outputs = self.mimi.encode(audio.to(mimi_param.device, mimi_param.dtype), num_quantizers=num_audio_quantizers)
+            audio = audio[:, None].to(mimi_param.device, mimi_param.dtype)
+            mimi_outputs = self.mimi.encode(audio, num_quantizers=num_audio_quantizers, padding_mask=audio_mask)
             assert isinstance(mimi_outputs, MimiEncoderOutput) and mimi_outputs.audio_codes is not None
             audio_codes = mimi_outputs.audio_codes.transpose(1, 2)
+
+            samples_per_code = int(self.mimi.config.sampling_rate / self.mimi.config._frame_rate)  # type: ignore
+            assert samples_per_code * self.mimi.config._frame_rate == self.mimi.config.sampling_rate  # type: ignore
+            padded_audio_mask = F.pad(audio_mask, (0, audio_codes.shape[1] * samples_per_code - audio_mask.shape[1]))
+            audio_codes_mask = padded_audio_mask.view(-1, audio_codes.shape[1], samples_per_code).any(dim=-1)
         else:
             audio_codes = None
+            audio_codes_mask = None
 
-        return self.process_text(text, audio_codes).to(self.text_model.device)
+        return self.process_text(text, audio_codes, audio_codes_mask, **tokenizer_kwargs).to(self.text_model.device)
 
 
 class QwenOmniWithMimiForConditionalGeneration(nn.Module):
@@ -340,14 +375,13 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         )
         self.lm_head = thinker.lm_head
         # TODO: update to support image/video inputs
-        del thinker
 
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
         audio_codes: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         audio_past_key_values: Optional[Cache] = None,
@@ -362,7 +396,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             input_ids=input_ids,
             audio_codes=audio_codes,
             attention_mask=attention_mask,
-            audio_attention_mask=audio_attention_mask,
+            audio_codes_mask=audio_codes_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             audio_past_key_values=audio_past_key_values,
@@ -396,44 +430,57 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         self,
         text: str | list[str],
         audio_codes: Optional[torch.Tensor] = None,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         audio_token: str = "<|AUDIO|>",
+        **tokenizer_kwargs,
     ) -> BatchFeature | BatchEncoding:
         return self.model.process_text(
             text=text,
             audio_codes=audio_codes,
-            audio_attention_mask=audio_attention_mask,
+            audio_codes_mask=audio_codes_mask,
             audio_token=audio_token,
+            **tokenizer_kwargs,
         )
 
     def process_inputs(
         self,
-        text: str,
-        audio: Optional[torch.Tensor | np.ndarray] = None,
-        audio_sample_rate: Optional[int] = None,
+        text: str | list[str],
+        audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
+        audio_sample_rate: Optional[int | list[int]] = None,
         num_audio_quantizers: int = 8,
+        **tokenizer_kwargs,
     ) -> BatchFeature | BatchEncoding:
         return self.model.process_inputs(
             text=text,
             audio=audio,
             audio_sample_rate=audio_sample_rate,
             num_audio_quantizers=num_audio_quantizers,
+            **tokenizer_kwargs,
         )
 
     @torch.inference_mode()
     def generate_greedy(
         self,
-        text: str,
-        audio: Optional[torch.Tensor | np.ndarray] = None,
-        audio_sample_rate: Optional[int] = None,
+        text: str | list[str],
+        audio: Optional[torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray]] = None,
+        audio_sample_rate: Optional[int | list[int]] = None,
         max_new_tokens: int = 128,
         eos_token_id: int = 151645,
         return_text: bool = False,
     ) -> str | torch.Tensor:
-        inputs = self.process_inputs(text, audio, audio_sample_rate)
+        if audio is not None:
+            if not isinstance(audio, list):
+                audio = [audio]
+
+            audio_tensors = [a if isinstance(a, torch.Tensor) else torch.from_numpy(a) for a in audio]
+        else:
+            audio_tensors = None
+
+        inputs = self.process_inputs(text, audio_tensors, audio_sample_rate, padding=True, padding_side="left")
         past_key_values = DynamicCache()
         outputs = self(**inputs, past_key_values=past_key_values, use_cache=True)
 
+        input_seq_len = inputs.input_ids.shape[1]
         input_ids = outputs.logits[:, -1:].argmax(dim=-1)
         attention_mask = F.pad(inputs.attention_mask, (0, 1), value=1)
         sequences = torch.cat((inputs.input_ids, input_ids), dim=1)
@@ -452,11 +499,11 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             attention_mask = F.pad(attention_mask, (0, 1), value=1)
             sequences = torch.cat((sequences, input_ids), dim=1)
 
-            if input_ids[0, -1].item() == eos_token_id:
+            if (sequences[:, input_seq_len:] == eos_token_id).any(dim=1).all():
                 break
 
         if return_text:
-            return self.model.text_tokenizer.decode(sequences[0], skip_special_tokens=True)
+            return self.model.text_tokenizer.batch_decode(sequences, skip_special_tokens=True)
         else:
             return sequences
 
@@ -469,6 +516,9 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
         adaptor_config: Optional[MimiToQwenOmniAdaptorConfig] = None,
         adaptor_config_path: Optional[str | Path] = None,
         adaptor_state_dict_path: Optional[str | Path] = None,
+        code_predictor_config: Optional[Qwen3OmniMoeTalkerCodePredictorConfig] = None,
+        code_predictor_config_path: Optional[str | Path] = None,
+        code_predictor_state_dict_path: Optional[str | Path] = None,
         dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "sdpa",
     ) -> None:
@@ -479,6 +529,11 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             assert adaptor_config is not None
             adaptor_config.decoder_config = Qwen3Config(**adaptor_config.decoder_config)  # type: ignore
             adaptor_config.decoder_config._attn_implementation = attn_implementation
+
+        if code_predictor_config is None:
+            assert code_predictor_config_path is not None
+            code_predictor_config = Qwen3OmniMoeTalkerCodePredictorConfig.from_json_file(code_predictor_config_path)  # type: ignore
+            assert code_predictor_config is not None
 
         mimi = MimiModel.from_pretrained(
             mimi_model_name_or_path,
@@ -517,16 +572,34 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             text_tokenizer=text_tokenizer,
             audio_token_id=thinker.config.audio_token_id,
         )
-        self.lm_head = thinker.lm_head
-        # TODO: update to support image/video inputs
-        del thinker
+        self.text_vocab_size = text_model.config.vocab_size
+        assert self.text_vocab_size == thinker.lm_head.out_features
+        self.lm_head = nn.Linear(
+            in_features=thinker.config.hidden_size,
+            out_features=self.text_vocab_size + mimi.config.codebook_size,
+            bias=False,
+            dtype=dtype,
+        )
+        with torch.no_grad():
+            self.lm_head.weight[: self.text_vocab_size].copy_(thinker.lm_head.weight)
+
+        self.code_predictor = Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration(code_predictor_config)
+        if code_predictor_state_dict_path is not None:
+            self.code_predictor.load_state_dict(torch.load(code_predictor_state_dict_path, map_location="cpu"))
+
+        self.proj_code = nn.Linear(
+            in_features=thinker.config.hidden_size,
+            out_features=code_predictor_config.hidden_size,
+            bias=False,
+            dtype=dtype,
+        )
 
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
         audio_codes: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         audio_past_key_values: Optional[Cache] = None,
@@ -541,7 +614,7 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             input_ids=input_ids,
             audio_codes=audio_codes,
             attention_mask=attention_mask,
-            audio_attention_mask=audio_attention_mask,
+            audio_codes_mask=audio_codes_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
             audio_past_key_values=audio_past_key_values,
@@ -551,8 +624,20 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             use_cache=use_cache,
             cache_position=cache_position,
         )
+        assert outputs.last_hidden_state is not None
 
         logits = self.lm_head(outputs.last_hidden_state)
+
+        if input_ids is not None and audio_codes is not None:
+            audio_hidden_states = outputs.last_hidden_state[
+                (input_ids == self.audio_token_id) | (input_ids >= self.text_vocab_size)
+            ]
+            if audio_codes_mask is None:
+                audio_codes = audio_codes.view(audio_codes.shape[0] * audio_codes.shape[1], -1)
+            else:
+                audio_codes = audio_codes[audio_codes_mask == 1]
+
+            assert audio_hidden_states.shape[0] == audio_codes.shape[0]
 
         if labels is not None:
             loss = self.model.text_model.loss_function(
@@ -575,66 +660,30 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
         self,
         text: str | list[str],
         audio_codes: Optional[torch.Tensor] = None,
-        audio_attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         audio_token: str = "<|AUDIO|>",
+        **tokenizer_kwargs,
     ) -> BatchFeature | BatchEncoding:
         return self.model.process_text(
             text=text,
             audio_codes=audio_codes,
-            audio_attention_mask=audio_attention_mask,
+            audio_codes_mask=audio_codes_mask,
             audio_token=audio_token,
+            **tokenizer_kwargs,
         )
 
     def process_inputs(
         self,
-        text: str,
-        audio: Optional[torch.Tensor | np.ndarray] = None,
-        audio_sample_rate: Optional[int] = None,
+        text: str | list[str],
+        audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
+        audio_sample_rate: Optional[int | list[int]] = None,
         num_audio_quantizers: int = 8,
+        **tokenizer_kwargs,
     ) -> BatchFeature | BatchEncoding:
         return self.model.process_inputs(
             text=text,
             audio=audio,
             audio_sample_rate=audio_sample_rate,
             num_audio_quantizers=num_audio_quantizers,
+            **tokenizer_kwargs,
         )
-
-    @torch.inference_mode()
-    def generate_greedy(
-        self,
-        text: str,
-        audio: Optional[torch.Tensor | np.ndarray] = None,
-        audio_sample_rate: Optional[int] = None,
-        max_new_tokens: int = 128,
-        eos_token_id: int = 151645,
-        return_text: bool = False,
-    ) -> str | torch.Tensor:
-        inputs = self.process_inputs(text, audio, audio_sample_rate)
-        past_key_values = DynamicCache()
-        outputs = self(**inputs, past_key_values=past_key_values, use_cache=True)
-
-        input_ids = outputs.logits[:, -1:].argmax(dim=-1)
-        attention_mask = F.pad(inputs.attention_mask, (0, 1), value=1)
-        sequences = torch.cat((inputs.input_ids, input_ids), dim=1)
-
-        for _ in range(max_new_tokens - 1):
-            position_ids = attention_mask.sum(dim=1, keepdim=True)
-            outputs = self(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                attention_mask=attention_mask,
-                past_key_values=past_key_values,
-                use_cache=True,
-            )
-
-            input_ids = outputs.logits[:, -1:].argmax(dim=-1)
-            attention_mask = F.pad(attention_mask, (0, 1), value=1)
-            sequences = torch.cat((sequences, input_ids), dim=1)
-
-            if input_ids[0, -1].item() == eos_token_id:
-                break
-
-        if return_text:
-            return self.model.text_tokenizer.decode(sequences[0], skip_special_tokens=True)
-        else:
-            return sequences
