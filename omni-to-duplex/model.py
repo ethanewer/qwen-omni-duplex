@@ -594,6 +594,23 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             dtype=dtype,
         )
 
+    def parallel_code_predictor_forward(
+        self,
+        hidden_embeds: torch.Tensor,
+        audio_codes: torch.Tensor,
+    ) -> torch.Tensor:
+        audio_code_embeds = [
+            self.code_predictor.get_input_embeddings()[i](audio_codes[:, [i]])
+            for i in range(self.code_predictor.config.num_code_groups - 1)
+        ]
+        inputs_embeds = torch.cat([hidden_embeds[:, None]] + audio_code_embeds, dim=1)
+        last_hidden_state = self.code_predictor.model(inputs_embeds=inputs_embeds).last_hidden_state
+        logits = [
+            self.code_predictor.lm_head[i](last_hidden_state[:, [i + 1]])
+            for i in range(self.code_predictor.config.num_code_groups - 1)
+        ]
+        return torch.cat(logits, dim=1)
+
     def compute_code_predictor_loss(
         self,
         input_ids: torch.Tensor,
@@ -617,20 +634,8 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
 
         assert hidden_embeds.shape[0] == audio_codes.shape[0]
 
-        audio_code_embeds = [
-            self.code_predictor.get_input_embeddings()[i](audio_codes[:, [i]])
-            for i in range(self.code_predictor.config.num_code_groups - 1)
-        ]
+        logits = self.parallel_code_predictor_forward(hidden_embeds=hidden_embeds, audio_codes=audio_codes)
 
-        code_predictor_embeds = torch.cat([hidden_embeds[:, None]] + audio_code_embeds, dim=1)
-        code_predictor_last_hidden_state = self.code_predictor.model(inputs_embeds=code_predictor_embeds).last_hidden_state
-        logits = torch.cat(
-            [
-                self.code_predictor.lm_head[i](code_predictor_last_hidden_state[:, [i + 1]])
-                for i in range(self.code_predictor.config.num_code_groups - 1)
-            ],
-            dim=1,
-        )
         return self.code_predictor.loss_function(
             logits=logits,
             labels=None,
