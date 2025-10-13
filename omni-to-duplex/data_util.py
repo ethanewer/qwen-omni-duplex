@@ -9,8 +9,8 @@ import numpy as np
 import soundfile as sf
 import torch
 import torchaudio
-from moshi.models import MimiModel
 from qwen_omni_utils import process_mm_info
+from transformers.models.mimi.modeling_mimi import MimiEncoderOutput, MimiModel
 from transformers.models.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
 
@@ -92,9 +92,15 @@ def iter_audio_samples(path: str | Path) -> Generator[AudioSample, None, None]:
 
 @torch.inference_mode()
 def get_quantized_mimi_features(mimi: MimiModel, sample: AudioSample) -> torch.Tensor:
-    param = next(iter(mimi.parameters()))
-    inputs = sample.to_tensor(new_sample_rate=24000).to(param.device, param.dtype)
-    return mimi.encode_to_latent(inputs[None, None])[0].T
+    mimi_param = next(iter(mimi.parameters()))
+    audio = sample.to_tensor(new_sample_rate=24000)
+    while audio.ndim < 3:
+        audio = audio[None]
+
+    mimi_outputs = mimi.encode(audio.to(mimi_param.device, mimi_param.dtype))
+    assert isinstance(mimi_outputs, MimiEncoderOutput) and mimi_outputs.audio_codes is not None
+    audio_codes = mimi_outputs.audio_codes.transpose(1, 2)
+    return mimi.quantizer.decode(audio_codes)[0].T
 
 
 @torch.inference_mode()

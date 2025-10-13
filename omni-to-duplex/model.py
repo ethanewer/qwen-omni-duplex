@@ -7,13 +7,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio.functional
-from huggingface_hub import hf_hub_download
-from moshi.models import loaders
 from torch import nn
-from transformers import AutoTokenizer
-from transformers.cache_utils import Cache, DynamicCache
-from transformers.configuration_utils import PretrainedConfig
-from transformers.feature_extraction_utils import BatchFeature
+from transformers import AutoTokenizer, BatchEncoding, BatchFeature, Cache, DynamicCache, PretrainedConfig
+from transformers.models.mimi.modeling_mimi import MimiEncoderOutput, MimiModel
 from transformers.models.qwen2_5_omni import Qwen2_5OmniThinkerForConditionalGeneration
 from transformers.models.qwen3 import Qwen3Config, Qwen3Model
 from transformers.utils.generic import ModelOutput
@@ -99,6 +95,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
     def __init__(
         self,
         text_model_name_or_path: str | Path,
+        mimi_model_name_or_path: str | Path = "kyutai/mimi",
         adaptor_config: Optional[MimiToQwenOmniAdaptorConfig] = None,
         adaptor_config_path: Optional[str | Path] = None,
         adaptor_state_dict_path: Optional[str | Path] = None,
@@ -114,7 +111,11 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             adaptor_config.decoder_config = Qwen3Config(**adaptor_config.decoder_config)  # type: ignore
             adaptor_config.decoder_config._attn_implementation = attn_implementation
 
-        self.mimi = loaders.get_mimi(hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME), num_codebooks=8).to(dtype)
+        self.mimi: MimiModel = MimiModel.from_pretrained(
+            mimi_model_name_or_path,
+            torch_dtype=dtype,
+            attn_implementation=attn_implementation,
+        )
         self.adaptor = MimiToQwenOmniAdaptor(adaptor_config).to(dtype)
         self.text_tokenizer = AutoTokenizer.from_pretrained(text_model_name_or_path)
         thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
@@ -154,7 +155,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         audio_past_key_values: Optional[Cache] = None,
         audio_use_cache: Optional[bool] = None,
     ) -> MimiToQwenOmniAdaptorOutputWithPast:
-        mimi_latent_features = self.mimi.decode_latent(audio_codes.transpose(1, 2)).transpose(1, 2)
+        mimi_latent_features = self.mimi.quantizer.decode(audio_codes.transpose(1, 2)).transpose(1, 2)
         return self.adaptor(
             inputs=mimi_latent_features,
             attention_mask=audio_attention_mask,
@@ -265,7 +266,7 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         audio_codes: Optional[torch.Tensor] = None,
         audio_attention_mask: Optional[torch.Tensor] = None,
         audio_token: str = "<|AUDIO|>",
-    ) -> BatchFeature:
+    ) -> BatchFeature | BatchEncoding:
         if audio_codes is not None:
             if audio_attention_mask is not None:
                 audio_lengths = iter(audio_attention_mask.sum(dim=1))
@@ -305,19 +306,25 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         text: str,
         audio: Optional[torch.Tensor | np.ndarray] = None,
         audio_sample_rate: Optional[int] = None,
-    ) -> BatchFeature:
+    ) -> BatchFeature | BatchEncoding:
         if audio is not None:
             if isinstance(audio, np.ndarray):
                 audio = torch.from_numpy(audio).float()
 
-            if audio_sample_rate is not None and audio_sample_rate != self.mimi.sample_rate:
-                audio = torchaudio.functional.resample(audio, orig_freq=audio_sample_rate, new_freq=self.mimi.sample_rate)
+            if audio_sample_rate is not None and audio_sample_rate != self.mimi.config.sampling_rate:
+                audio = torchaudio.functional.resample(
+                    audio,
+                    orig_freq=audio_sample_rate,
+                    new_freq=self.mimi.config.sampling_rate,
+                )
 
             while audio.ndim < 3:
                 audio = audio[None]
 
             mimi_param = next(iter(self.mimi.parameters()))
-            audio_codes = self.mimi.encode(audio.to(mimi_param.device, mimi_param.dtype)).transpose(1, 2)
+            mimi_outputs = self.mimi.encode(audio.to(mimi_param.device, mimi_param.dtype))
+            assert isinstance(mimi_outputs, MimiEncoderOutput) and mimi_outputs.audio_codes is not None
+            audio_codes = mimi_outputs.audio_codes.transpose(1, 2)
         else:
             audio_codes = None
 
