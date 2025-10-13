@@ -18,7 +18,7 @@ from transformers.models.qwen3 import Qwen3Config
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
 
-from model import Adaptor, AdaptorConfig
+from model import MimiToQwenOmniAdaptor, MimiToQwenOmniAdaptorConfig
 
 
 def debug_xml(obj, name: str) -> None:
@@ -29,8 +29,8 @@ def debug_xml(obj, name: str) -> None:
 @dataclass
 class AdaptorRunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
-    input_size: int = field(default=512, metadata={"help": "Adaptor input feature size."})
-    output_size: int = field(default=2048, metadata={"help": "Adaptor output feature size."})
+    input_size: int = field(default=512, metadata={"help": "MimiToQwenOmniAdaptor input feature size."})
+    output_size: int = field(default=2048, metadata={"help": "MimiToQwenOmniAdaptor output feature size."})
     output_time_scale: int = field(default=2, metadata={"help": "Timesteps produced per input step."})
     lag_timesteps: int = field(default=0, metadata={"help": "Timestep lag between outputs and targets for loss calculation."})
     adaptor_decoder_config_path: str = field(
@@ -47,12 +47,12 @@ class AdaptorRunArguments:
     final_filename: str = field(default="adaptor.pt", metadata={"help": "Filename of final saved adaptor weights."})
 
     @property
-    def adaptor_config(self) -> AdaptorConfig:
+    def adaptor_config(self) -> MimiToQwenOmniAdaptorConfig:
         decoder_config = Qwen3Config.from_json_file(self.adaptor_decoder_config_path)
         if self.attn_implementation is not None:
             decoder_config._attn_implementation = self.attn_implementation
 
-        return AdaptorConfig(
+        return MimiToQwenOmniAdaptorConfig(
             input_size=self.input_size,
             output_size=self.output_size,
             output_time_scale=self.output_time_scale,
@@ -170,7 +170,7 @@ def main() -> None:
     eval_dataset = FeatureShardIterableDataset(shard_paths[-1:], max_size=run_args.max_eval_dataset_size)
 
     adaptor_config = run_args.adaptor_config
-    model: nn.Module = Adaptor(adaptor_config)
+    model: nn.Module = MimiToQwenOmniAdaptor(adaptor_config)
     if run_args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)  # type: ignore
 

@@ -11,7 +11,7 @@ from transformers.models.qwen2_5_omni import Qwen2_5OmniThinkerConfig, Qwen2_5Om
 from transformers.models.qwen3 import Qwen3Config, Qwen3Model
 
 
-class AdaptorConfig(PretrainedConfig):
+class MimiToQwenOmniAdaptorConfig(PretrainedConfig):
     input_size: int
     output_size: int
     output_time_scale: int
@@ -19,8 +19,8 @@ class AdaptorConfig(PretrainedConfig):
     decoder_config: Qwen3Config
 
 
-class Adaptor(nn.Module):
-    def __init__(self, config: AdaptorConfig):
+class MimiToQwenOmniAdaptor(nn.Module):
+    def __init__(self, config: MimiToQwenOmniAdaptorConfig):
         super().__init__()
         self.config = config
         self.input_size = config.input_size
@@ -67,10 +67,10 @@ class Adaptor(nn.Module):
 
 
 class QwenOmniThinkerWithMimiAdaptor(Qwen2_5OmniThinkerForConditionalGeneration):
-    def __init__(self, config: Qwen2_5OmniThinkerConfig, audio_adaptor_config: AdaptorConfig) -> None:
+    def __init__(self, config: Qwen2_5OmniThinkerConfig, audio_adaptor_config: MimiToQwenOmniAdaptorConfig) -> None:
         super().__init__(config)
         self.mimi = loaders.get_mimi(hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME), num_codebooks=8)
-        self.adaptor = Adaptor(audio_adaptor_config)
+        self.adaptor = MimiToQwenOmniAdaptor(audio_adaptor_config)
         assert self.adaptor.lag_timesteps == 0
         del self.audio_tower
 
@@ -88,7 +88,7 @@ class QwenOmniThinkerWithMimiAdaptor(Qwen2_5OmniThinkerForConditionalGeneration)
 
 def update_qwen2_5_omni_with_adaptor(
     model: Qwen2_5OmniThinkerForConditionalGeneration,
-    adaptor: Adaptor,
+    adaptor: MimiToQwenOmniAdaptor,
 ) -> QwenOmniThinkerWithMimiAdaptor:
     assert adaptor.lag_timesteps == 0
     model.mimi = loaders.get_mimi(hf_hub_download(loaders.DEFAULT_REPO, loaders.MIMI_NAME), num_codebooks=8)
@@ -111,10 +111,10 @@ def load_qwen_omni_thinker_with_mimi_adaptor(
         torch_dtype=dtype,
         attn_implementation=attn_implementation,
     )
-    adaptor_config: AdaptorConfig = AdaptorConfig.from_json_file(adaptor_config_path)  # type: ignore
+    adaptor_config: MimiToQwenOmniAdaptorConfig = MimiToQwenOmniAdaptorConfig.from_json_file(adaptor_config_path)  # type: ignore
     adaptor_config.decoder_config = Qwen3Config(**adaptor_config.decoder_config)  # type: ignore
     adaptor_config.decoder_config._attn_implementation = attn_implementation
-    adaptor = Adaptor(adaptor_config)
+    adaptor = MimiToQwenOmniAdaptor(adaptor_config)
     if adaptor_state_dict_path is not None:
         adaptor.load_state_dict(torch.load(adaptor_state_dict_path, map_location="cpu"))
 
