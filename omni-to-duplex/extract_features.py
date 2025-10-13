@@ -35,21 +35,19 @@ def process_tar(
 
     mimi_features = {}
     for key, sample in tqdm(samples.items(), desc="Encoding Mimi"):
-        # try:
-        #     mimi_features[key] = get_quantized_mimi_features(mimi, sample).cpu()
-        # except Exception as e:
-        #     print(f"ERROR processing {tar_path}: {e}", flush=True)
-        #     continue
-        mimi_features[key] = get_quantized_mimi_features(mimi, sample).cpu()
+        try:
+            mimi_features[key] = get_quantized_mimi_features(mimi, sample).cpu()
+        except Exception as e:
+            print(f"ERROR processing {tar_path}: {e}", flush=True)
+            continue
 
     qwen_omni_features = {}
     for key, sample in tqdm(samples.items(), desc="Encoding Qwen-Omni"):
-        # try:
-        #     qwen_omni_features[key] = get_qwen_omni_features(qwen_omni, processor, sample).cpu()
-        # except Exception as e:
-        #     print(f"ERROR processing {tar_path} ({key}): {e}", flush=True)
-        #     continue
-        qwen_omni_features[key] = get_qwen_omni_features(qwen_omni, processor, sample).cpu()
+        try:
+            qwen_omni_features[key] = get_qwen_omni_features(qwen_omni, processor, sample).cpu()
+        except Exception as e:
+            print(f"ERROR processing {tar_path} ({key}): {e}", flush=True)
+            continue
 
     results = {
         "source_file": str(tar_path),
@@ -126,23 +124,16 @@ def main() -> None:
     data_files = sorted([p for p in tts_data_path.iterdir() if p.is_file() and p.suffix in [".tar"]])
 
     for tar_path in tqdm(data_files, desc="Processing files"):
-        # try:
-        #     process_tar(
-        #         tar_path=tar_path,
-        #         out_dir=out_dir,
-        #         mimi=mimi,
-        #         qwen_omni=qwen_omni,
-        #         processor=processor,  # type: ignore
-        #     )
-        # except Exception as e:
-        #     print(f"ERROR processing {tar_path}: {e}", flush=True)
-        process_tar(
-            tar_path=tar_path,
-            out_dir=out_dir,
-            mimi=mimi,
-            qwen_omni=qwen_omni,
-            processor=processor,  # type: ignore
-        )
+        try:
+            process_tar(
+                tar_path=tar_path,
+                out_dir=out_dir,
+                mimi=mimi,
+                qwen_omni=qwen_omni,
+                processor=processor,  # type: ignore
+            )
+        except Exception as e:
+            print(f"ERROR processing {tar_path}: {e}", flush=True)
 
 
 if __name__ == "__main__":
