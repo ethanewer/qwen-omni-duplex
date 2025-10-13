@@ -8,7 +8,7 @@ from moshi.models import MimiModel, loaders
 from tqdm import tqdm
 from transformers.models.qwen2_5_omni import Qwen2_5OmniForConditionalGeneration, Qwen2_5OmniProcessor
 
-from data_util import get_quantized_mimi_features, get_qwen_omni_features, load_audio_samples
+from data_util import get_quantized_mimi_features, get_qwen2_5_omni_features, load_audio_samples
 
 
 def process_tar(
@@ -40,7 +40,7 @@ def process_tar(
     qwen_omni_features = {}
     for key, sample in tqdm(samples.items(), desc="Encoding Qwen-Omni"):
         try:
-            qwen_omni_features[key] = get_qwen_omni_features(qwen_omni, processor, sample).cpu()
+            qwen_omni_features[key] = get_qwen2_5_omni_features(qwen_omni, processor, sample).cpu()
         except Exception as e:
             print(f"ERROR processing {tar_path} ({key}): {e}", flush=True)
             continue

@@ -94,12 +94,11 @@ def iter_audio_samples(path: str | Path) -> Generator[AudioSample, None, None]:
 def get_quantized_mimi_features(mimi: MimiModel, sample: AudioSample) -> torch.Tensor:
     param = next(iter(mimi.parameters()))
     inputs = sample.to_tensor(new_sample_rate=24000).to(param.device, param.dtype)
-    with torch.no_grad():
-        return mimi.encode_to_latent(inputs[None, None])[0].T
+    return mimi.encode_to_latent(inputs[None, None])[0].T
 
 
 @torch.inference_mode()
-def get_qwen_omni_features(
+def get_qwen2_5_omni_features(
     qwen_omni: Qwen2_5OmniForConditionalGeneration,
     processor: Qwen2_5OmniProcessor,
     sample: AudioSample,
@@ -109,5 +108,12 @@ def get_qwen_omni_features(
     audios, _, _ = process_mm_info(conversation, use_audio_in_video=True)  # type: ignore
     inputs = processor(text="", audio=audios, return_tensors="pt", padding=True, use_audio_in_video=True)  # type: ignore
     inputs = inputs.to(param.device, param.dtype)
-    with torch.no_grad():
-        return qwen_omni.thinker.get_audio_features(inputs.input_features, inputs.feature_attention_mask)
+    return qwen_omni.thinker.get_audio_features(inputs.input_features, inputs.feature_attention_mask)
+
+
+@torch.inference_mode()
+def get_qwen3_omni_features(
+    qwen_omni: Qwen2_5OmniForConditionalGeneration,
+    processor: Qwen2_5OmniProcessor,
+    sample: AudioSample,
+) -> torch.Tensor: ...
