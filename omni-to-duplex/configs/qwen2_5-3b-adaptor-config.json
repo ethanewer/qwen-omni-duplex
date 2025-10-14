@@ -2,7 +2,7 @@
     "input_size": 512,
     "output_size": 2048,
     "output_time_scale": 2,
-    "lag_timesteps": 0,
+    "lag_timesteps": 2,
     "decoder_config": {
         "architectures": [
             "Qwen3Model"

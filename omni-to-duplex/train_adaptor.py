@@ -14,7 +14,6 @@ from torch import nn
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_state_dict
 from torch.utils.data import IterableDataset
 from transformers.hf_argparser import HfArgumentParser
-from transformers.models.qwen3 import Qwen3Config
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
 
@@ -29,13 +28,9 @@ def debug_xml(obj, name: str) -> None:
 @dataclass
 class RunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
-    input_size: int = field(default=512, metadata={"help": "MimiToQwenOmniAdaptor input feature size."})
-    output_size: int = field(default=2048, metadata={"help": "MimiToQwenOmniAdaptor output feature size."})
-    output_time_scale: int = field(default=2, metadata={"help": "Timesteps produced per input step."})
-    lag_timesteps: int = field(default=0, metadata={"help": "Timestep lag between outputs and targets for loss calculation."})
-    adaptor_decoder_config_path: str = field(
-        default="configs/adaptor_decoder_config.json",
-        metadata={"help": "Path to a Qwen3Model config."},
+    adaptor_config_path: str = field(
+        default="configs/qwen3-30b-a3b-adaptor-config.json",
+        metadata={"help": "Path to config JSON file."},
     )
     attn_implementation: Optional[str] = field(
         default="flash_attention_2",
@@ -48,17 +43,7 @@ class RunArguments:
 
     @property
     def adaptor_config(self) -> MimiToQwenOmniAdaptorConfig:
-        decoder_config = Qwen3Config.from_json_file(self.adaptor_decoder_config_path)
-        if self.attn_implementation is not None:
-            decoder_config._attn_implementation = self.attn_implementation
-
-        return MimiToQwenOmniAdaptorConfig(
-            input_size=self.input_size,
-            output_size=self.output_size,
-            output_time_scale=self.output_time_scale,
-            lag_timesteps=self.lag_timesteps,
-            decoder_config=decoder_config,
-        )
+        return MimiToQwenOmniAdaptorConfig.from_json_file(self.adaptor_config_path)
 
 
 class FeatureShardIterableDataset(IterableDataset):
@@ -183,7 +168,7 @@ def main() -> None:
         data_collator=partial(
             collate_fn_alignment,
             max_input_seq_len=run_args.max_input_seq_len,
-            output_time_scale=run_args.output_time_scale,
+            output_time_scale=adaptor_config.output_time_scale,
         ),
     )
 

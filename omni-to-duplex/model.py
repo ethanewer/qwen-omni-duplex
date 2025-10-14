@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Optional
+from os import PathLike
+from typing import Optional, Self, cast
 
 import numpy as np
 import torch
@@ -10,31 +10,57 @@ import torchaudio.functional
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import (
-    AutoTokenizer,
-    BatchEncoding,
     BatchFeature,
     Cache,
     DynamicCache,
+    MimiConfig,
+    MimiModel,
     PretrainedConfig,
+    Qwen2_5OmniProcessor,
     Qwen2_5OmniThinkerForConditionalGeneration,
     Qwen2_5OmniThinkerTextModel,
     Qwen3Config,
     Qwen3Model,
+    Qwen3OmniMoeProcessor,
     Qwen3OmniMoeTalkerCodePredictorModelForConditionalGeneration,
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextModel,
 )
-from transformers.models.mimi.modeling_mimi import MimiEncoderOutput, MimiModel
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTalkerCodePredictorConfig
+from transformers.modeling_utils import PreTrainedModel
+from transformers.models.mimi.modeling_mimi import MimiEncoderOutput
+from transformers.models.qwen2_5_omni.configuration_qwen2_5_omni import Qwen2_5OmniTextConfig
+from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
+    Qwen3OmniMoeTalkerCodePredictorConfig,
+    Qwen3OmniMoeTextConfig,
+)
 from transformers.utils.generic import ModelOutput
 
 
-class MimiToQwenOmniAdaptorConfig(PretrainedConfig):  # type: ignore
+class MimiToQwenOmniAdaptorConfig(PretrainedConfig):
     input_size: int
     output_size: int
     output_time_scale: int
     lag_timesteps: int
     decoder_config: Qwen3Config
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fix_config(self)
+
+    @classmethod
+    def fix_config(cls, config: PretrainedConfig) -> PretrainedConfig:
+        if hasattr(config, "decoder_config") and isinstance(config.decoder_config, dict):
+            config.decoder_config = Qwen3Config(**config.decoder_config)
+
+        return config
+
+    @classmethod
+    def from_json_file(cls: type[Self], *args, **kwargs) -> Self:
+        return cast(Self, cls.fix_config(PretrainedConfig.from_json_file(*args, **kwargs)))
+
+    @classmethod
+    def from_pretrained(cls: type[Self], *args, **kwargs) -> Self:
+        return cast(Self, cls.fix_config(PretrainedConfig.from_pretrained(*args, **kwargs)))
 
 
 @dataclass
@@ -44,9 +70,11 @@ class MimiToQwenOmniAdaptorOutputWithPast(ModelOutput):
     past_key_values: Optional[Cache] = None
 
 
-class MimiToQwenOmniAdaptor(nn.Module):
+class MimiToQwenOmniAdaptor(PreTrainedModel):
+    config: MimiToQwenOmniAdaptorConfig
+
     def __init__(self, config: MimiToQwenOmniAdaptorConfig):
-        super().__init__()
+        super().__init__(config)
         self.config = config
         self.input_size = config.input_size
         self.output_size = config.output_size
@@ -104,6 +132,44 @@ class MimiToQwenOmniAdaptor(nn.Module):
         )
 
 
+class QwenOmniWithMimiConfig(PretrainedConfig):
+    mimi_config: MimiConfig
+    adaptor_config: MimiToQwenOmniAdaptorConfig
+    text_model_config: Qwen2_5OmniTextConfig | Qwen3OmniMoeTextConfig
+    audio_token_id: int
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.fix_config(self)
+
+    @classmethod
+    def fix_config(cls, config: PretrainedConfig) -> PretrainedConfig:
+        if hasattr(config, "mimi_config") and isinstance(config.mimi_config, dict):
+            config.mimi_config = MimiConfig(**config.mimi_config)
+
+        if hasattr(config, "adaptor_config") and isinstance(config.adaptor_config, dict):
+            config.adaptor_config = MimiToQwenOmniAdaptorConfig(**config.adaptor_config)
+
+        if hasattr(config, "text_model_config") and isinstance(config.text_model_config, dict):
+            model_type = config.text_model_config["model_type"]
+            if model_type == Qwen2_5OmniTextConfig.model_type:
+                config.text_model_config = Qwen2_5OmniTextConfig(**config.text_model_config)
+            elif model_type == Qwen3OmniMoeTextConfig.model_type:
+                config.text_model_config = Qwen3OmniMoeTextConfig(**config.text_model_config)
+            else:
+                raise NotImplementedError(f"`text_model.model_type={model_type}` is not supported.")
+
+        return config
+
+    @classmethod
+    def from_json_file(cls: type[Self], *args, **kwargs) -> Self:
+        return cast(Self, cls.fix_config(PretrainedConfig.from_json_file(*args, **kwargs)))
+
+    @classmethod
+    def from_pretrained(cls: type[Self], *args, **kwargs) -> Self:
+        return cast(Self, cls.fix_config(PretrainedConfig.from_pretrained(*args, **kwargs)))
+
+
 @dataclass
 class QwenOmniWithMimiOutputWithPast(ModelOutput):
     loss: Optional[torch.Tensor] = None
@@ -114,21 +180,45 @@ class QwenOmniWithMimiOutputWithPast(ModelOutput):
     rope_deltas: Optional[torch.Tensor] = None
 
 
-class QwenOmniWithMimi(nn.Module):
-    def __init__(
-        self,
+class QwenOmniWithMimi(PreTrainedModel):
+    config: QwenOmniWithMimiConfig
+
+    def __init__(self, config: QwenOmniWithMimiConfig) -> None:
+        super().__init__(config)
+        self.config = config
+        self.mimi = MimiModel._from_config(config.mimi_config)
+        self.adaptor = MimiToQwenOmniAdaptor._from_config(config.adaptor_config)
+        model_type = config.text_model_config.model_type
+        if model_type == Qwen2_5OmniTextConfig.model_type:
+            self.text_model = Qwen2_5OmniThinkerTextModel._from_config(config.text_model_config)
+        elif model_type == Qwen3OmniMoeTextConfig.model_type:
+            self.text_model = Qwen3OmniMoeThinkerTextModel._from_config(config.text_model_config)
+
+        self.audio_token_id = config.audio_token_id
+
+    @classmethod
+    def from_parts(
+        cls,
         mimi: MimiModel,
         adaptor: MimiToQwenOmniAdaptor,
         text_model: Qwen2_5OmniThinkerTextModel | Qwen3OmniMoeThinkerTextModel,
-        text_tokenizer: Any,
         audio_token_id: int,
-    ) -> None:
-        super().__init__()
-        self.mimi = mimi
-        self.adaptor = adaptor
-        self.text_model = text_model
-        self.text_tokenizer = text_tokenizer
-        self.audio_token_id = audio_token_id
+    ) -> Self:
+        print("here 5")
+        config = QwenOmniWithMimiConfig(
+            mimi_config=mimi.config,
+            adaptor_config=adaptor.config,
+            text_model_config=text_model.config,
+            audio_token_id=audio_token_id,
+        )
+        model = cast(Self, object.__new__(cls))
+        PreTrainedModel.__init__(model, config)
+        model.config = config
+        model.mimi = mimi
+        model.adaptor = adaptor
+        model.text_model = text_model
+        model.audio_token_id = audio_token_id
+        return model
 
     def get_audio_features(
         self,
@@ -229,8 +319,7 @@ class QwenOmniWithMimi(nn.Module):
         audio_codes: Optional[torch.Tensor] = None,
         audio_codes_mask: Optional[torch.Tensor] = None,
         audio_token: str = "<|AUDIO|>",
-        **tokenizer_kwargs,
-    ) -> BatchFeature | BatchEncoding:
+    ) -> str | list[str]:
         if audio_codes is not None:
             output_time_scale = self.adaptor.output_time_scale
             lag_timesteps = self.adaptor.lag_timesteps
@@ -241,7 +330,10 @@ class QwenOmniWithMimi(nn.Module):
         else:
             audio_lengths = iter([])
 
-        if not isinstance(text, list):
+        if isinstance(text, list):
+            is_batch = True
+        else:
+            is_batch = False
             text = [text]
 
         processed_text = []
@@ -260,22 +352,14 @@ class QwenOmniWithMimi(nn.Module):
             sample = sample.replace("<|audio_placeholder|>", audio_token)
             processed_text.append(sample)
 
-        processed_inputs = self.text_tokenizer(processed_text, return_tensors="pt", **tokenizer_kwargs)
-        processed_inputs["audio_codes"] = audio_codes
-        processed_inputs["audio_codes_mask"] = audio_codes_mask
-        return processed_inputs
+        return processed_text if is_batch else processed_text[0]
 
-    def process_inputs(
+    def process_audio(
         self,
-        text: str | list[str],
         audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
         audio_sample_rate: Optional[int | list[int]] = None,
         num_audio_quantizers: int = 8,
-        **tokenizer_kwargs,
-    ) -> BatchFeature | BatchEncoding:
-        if not isinstance(text, list):
-            text = [text]
-
+    ) -> BatchFeature:
         if audio is not None:
             if not isinstance(audio, list):
                 audio = [audio]
@@ -314,27 +398,37 @@ class QwenOmniWithMimi(nn.Module):
             audio_codes = None
             audio_codes_mask = None
 
-        return self.process_text(text, audio_codes, audio_codes_mask, **tokenizer_kwargs).to(self.text_model.device)
+        return BatchFeature({"audio_codes": audio_codes, "audio_codes_mask": audio_codes_mask}).to(self.text_model.device)
 
 
-class QwenOmniWithMimiForConditionalGeneration(nn.Module):
-    def __init__(
-        self,
-        text_model_name_or_path: str | Path,
-        mimi_model_name_or_path: str | Path = "kyutai/mimi",
-        adaptor_config: Optional[MimiToQwenOmniAdaptorConfig] = None,
-        adaptor_config_path: Optional[str | Path] = None,
-        adaptor_state_dict_path: Optional[str | Path] = None,
+class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
+    config: QwenOmniWithMimiConfig
+
+    def __init__(self, config: QwenOmniWithMimiConfig) -> None:
+        super().__init__(config)
+        self.config = config
+        self.model = QwenOmniWithMimi._from_config(config)
+        self.lm_head = nn.Linear(
+            in_features=config.text_model_config.hidden_size,
+            out_features=config.text_model_config.vocab_size,
+            bias=False,
+            dtype=self.model.dtype,
+        )
+        self.process_text = self.model.process_text
+        self.process_audio = self.model.process_audio
+
+    @classmethod
+    def from_paths(
+        cls,
+        text_model_name_or_path: str | PathLike,
+        adaptor_config_path: str | PathLike,
+        mimi_model_name_or_path: str | PathLike = "kyutai/mimi",
+        adaptor_state_dict_path: Optional[str | PathLike] = None,
         dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "sdpa",
-    ) -> None:
-        super().__init__()
-        if adaptor_config is None:
-            assert adaptor_config_path is not None
-            adaptor_config = MimiToQwenOmniAdaptorConfig.from_json_file(adaptor_config_path)  # type: ignore
-            assert adaptor_config is not None
-            adaptor_config.decoder_config = Qwen3Config(**adaptor_config.decoder_config)  # type: ignore
-            adaptor_config.decoder_config._attn_implementation = attn_implementation
+    ) -> Self:
+        adaptor_config = MimiToQwenOmniAdaptorConfig.from_json_file(adaptor_config_path)
+        adaptor_config.decoder_config._attn_implementation = attn_implementation
 
         mimi = MimiModel.from_pretrained(
             mimi_model_name_or_path,
@@ -344,11 +438,9 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         for param in mimi.parameters():
             param.requires_grad = False
 
-        adaptor = MimiToQwenOmniAdaptor(adaptor_config).to(dtype)
+        adaptor = MimiToQwenOmniAdaptor._from_config(adaptor_config, dtype=dtype)
         if adaptor_state_dict_path is not None:
             adaptor.load_state_dict(torch.load(adaptor_state_dict_path, map_location="cpu"))
-
-        text_tokenizer = AutoTokenizer.from_pretrained(text_model_name_or_path)
 
         if "Qwen2.5" in str(text_model_name_or_path):
             thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
@@ -365,16 +457,20 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
         else:
             raise NotImplementedError("`text_model_name_or_path` must be a variant of `Qwen2.5-Omni` or `Qwen3OmniMoe`.")
 
-        text_model = thinker.model
-        self.model = QwenOmniWithMimi(
+        base_model = QwenOmniWithMimi.from_parts(
             mimi=mimi,
             adaptor=adaptor,
-            text_model=text_model,
-            text_tokenizer=text_tokenizer,
+            text_model=thinker.model,
             audio_token_id=thinker.config.audio_token_id,
         )
-        self.lm_head = thinker.lm_head
-        # TODO: update to support image/video inputs
+        model = cast(Self, object.__new__(cls))
+        PreTrainedModel.__init__(model, base_model.config)
+        model.config = base_model.config
+        model.model = base_model
+        model.lm_head = thinker.lm_head
+        model.process_text = base_model.process_text
+        model.process_audio = base_model.process_audio
+        return model
 
     def forward(
         self,
@@ -426,64 +522,32 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             rope_deltas=outputs.rope_deltas,
         )
 
-    def process_text(
-        self,
-        text: str | list[str],
-        audio_codes: Optional[torch.Tensor] = None,
-        audio_codes_mask: Optional[torch.Tensor] = None,
-        audio_token: str = "<|AUDIO|>",
-        **tokenizer_kwargs,
-    ) -> BatchFeature | BatchEncoding:
-        return self.model.process_text(
-            text=text,
-            audio_codes=audio_codes,
-            audio_codes_mask=audio_codes_mask,
-            audio_token=audio_token,
-            **tokenizer_kwargs,
-        )
-
-    def process_inputs(
-        self,
-        text: str | list[str],
-        audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
-        audio_sample_rate: Optional[int | list[int]] = None,
-        num_audio_quantizers: int = 8,
-        **tokenizer_kwargs,
-    ) -> BatchFeature | BatchEncoding:
-        return self.model.process_inputs(
-            text=text,
-            audio=audio,
-            audio_sample_rate=audio_sample_rate,
-            num_audio_quantizers=num_audio_quantizers,
-            **tokenizer_kwargs,
-        )
-
     @torch.inference_mode()
     def generate_greedy(
         self,
-        text: str | list[str],
-        audio: Optional[torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray]] = None,
-        audio_sample_rate: Optional[int | list[int]] = None,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        audio_codes: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
         max_new_tokens: int = 128,
         eos_token_id: int = 151645,
-        return_text: bool = False,
     ) -> str | torch.Tensor:
-        if audio is not None:
-            if not isinstance(audio, list):
-                audio = [audio]
-
-            audio_tensors = [a if isinstance(a, torch.Tensor) else torch.from_numpy(a) for a in audio]
-        else:
-            audio_tensors = None
-
-        inputs = self.process_inputs(text, audio_tensors, audio_sample_rate, padding=True, padding_side="left")
         past_key_values = DynamicCache()
-        outputs = self(**inputs, past_key_values=past_key_values, use_cache=True)
+        outputs = self(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            audio_codes=audio_codes,
+            audio_codes_mask=audio_codes_mask,
+            past_key_values=past_key_values,
+            use_cache=True,
+        )
 
-        input_seq_len = inputs.input_ids.shape[1]
+        input_seq_len = input_ids.shape[1]
+        sequences = input_ids
+
         input_ids = outputs.logits[:, -1:].argmax(dim=-1)
-        attention_mask = F.pad(inputs.attention_mask, (0, 1), value=1)
-        sequences = torch.cat((inputs.input_ids, input_ids), dim=1)
+        attention_mask = F.pad(attention_mask, (0, 1), value=1)
+        sequences = torch.cat((sequences, input_ids), dim=1)
 
         for _ in range(max_new_tokens - 1):
             position_ids = attention_mask.sum(dim=1, keepdim=True)
@@ -502,32 +566,27 @@ class QwenOmniWithMimiForConditionalGeneration(nn.Module):
             if (sequences[:, input_seq_len:] == eos_token_id).any(dim=1).all():
                 break
 
-        if return_text:
-            return self.model.text_tokenizer.batch_decode(sequences, skip_special_tokens=True)
-        else:
-            return sequences
+        return sequences
 
 
 class QwenOmniWithMimiAudioOutput(nn.Module):
     def __init__(
         self,
-        text_model_name_or_path: str | Path,
-        mimi_model_name_or_path: str | Path = "kyutai/mimi",
+        text_model_name_or_path: str | PathLike,
+        mimi_model_name_or_path: str | PathLike = "kyutai/mimi",
         adaptor_config: Optional[MimiToQwenOmniAdaptorConfig] = None,
-        adaptor_config_path: Optional[str | Path] = None,
-        adaptor_state_dict_path: Optional[str | Path] = None,
+        adaptor_config_path: Optional[str | PathLike] = None,
+        adaptor_state_dict_path: Optional[str | PathLike] = None,
         code_predictor_config: Optional[Qwen3OmniMoeTalkerCodePredictorConfig] = None,
-        code_predictor_config_path: Optional[str | Path] = None,
-        code_predictor_state_dict_path: Optional[str | Path] = None,
+        code_predictor_config_path: Optional[str | PathLike] = None,
+        code_predictor_state_dict_path: Optional[str | PathLike] = None,
         dtype: torch.dtype = torch.bfloat16,
         attn_implementation: str = "sdpa",
     ) -> None:
         super().__init__()
         if adaptor_config is None:
             assert adaptor_config_path is not None
-            adaptor_config = MimiToQwenOmniAdaptorConfig.from_json_file(adaptor_config_path)  # type: ignore
-            assert adaptor_config is not None
-            adaptor_config.decoder_config = Qwen3Config(**adaptor_config.decoder_config)  # type: ignore
+            adaptor_config = MimiToQwenOmniAdaptorConfig.from_json_file(adaptor_config_path)
             adaptor_config.decoder_config._attn_implementation = attn_implementation
 
         if code_predictor_config is None:
@@ -543,11 +602,9 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
         for param in mimi.parameters():
             param.requires_grad = False
 
-        adaptor = MimiToQwenOmniAdaptor(adaptor_config).to(dtype)
+        adaptor = MimiToQwenOmniAdaptor._from_config(adaptor_config, dtype=dtype)
         if adaptor_state_dict_path is not None:
             adaptor.load_state_dict(torch.load(adaptor_state_dict_path, map_location="cpu"))
-
-        text_tokenizer = AutoTokenizer.from_pretrained(text_model_name_or_path)
 
         if "Qwen2.5" in str(text_model_name_or_path):
             thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
@@ -565,11 +622,10 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             raise NotImplementedError("`text_model_name_or_path` must be a variant of `Qwen2.5-Omni` or `Qwen3OmniMoe`.")
 
         text_model = thinker.model
-        self.model = QwenOmniWithMimi(
+        self.model = QwenOmniWithMimi.from_parts(
             mimi=mimi,
             adaptor=adaptor,
             text_model=text_model,
-            text_tokenizer=text_tokenizer,
             audio_token_id=thinker.config.audio_token_id,
         )
         self.text_vocab_size = text_model.config.vocab_size
@@ -716,34 +772,32 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             rope_deltas=outputs.rope_deltas,
         )
 
-    def process_text(
-        self,
-        text: str | list[str],
-        audio_codes: Optional[torch.Tensor] = None,
-        audio_codes_mask: Optional[torch.Tensor] = None,
-        audio_token: str = "<|AUDIO|>",
-        **tokenizer_kwargs,
-    ) -> BatchFeature | BatchEncoding:
-        return self.model.process_text(
-            text=text,
-            audio_codes=audio_codes,
-            audio_codes_mask=audio_codes_mask,
-            audio_token=audio_token,
-            **tokenizer_kwargs,
-        )
 
-    def process_inputs(
-        self,
-        text: str | list[str],
-        audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
-        audio_sample_rate: Optional[int | list[int]] = None,
-        num_audio_quantizers: int = 8,
-        **tokenizer_kwargs,
-    ) -> BatchFeature | BatchEncoding:
-        return self.model.process_inputs(
-            text=text,
-            audio=audio,
-            audio_sample_rate=audio_sample_rate,
-            num_audio_quantizers=num_audio_quantizers,
-            **tokenizer_kwargs,
-        )
+def process_qwen_with_mimi_inputs(
+    model: QwenOmniWithMimiForConditionalGeneration,
+    processor: Qwen2_5OmniProcessor | Qwen3OmniMoeProcessor,
+    conversation: list[dict] | list[list[dict]],
+    audio: Optional[torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray]] = None,
+    audio_sample_rate: Optional[int | list[int]] = None,
+    add_generation_prompt: bool = False,
+) -> BatchFeature:
+    assert len(conversation) > 0
+    if audio:
+        if isinstance(audio, list):
+            audio = [torch.from_numpy(a) if isinstance(a, np.ndarray) else a for a in audio]
+        elif isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio)
+
+        audio_inputs = model.process_audio(audio=audio, audio_sample_rate=audio_sample_rate)  # type: ignore
+    else:
+        audio_inputs = {}
+
+    texts = processor.apply_chat_template(conversation, add_generation_prompt=add_generation_prompt, tokenize=False)
+    processed_texts = model.process_text(texts, **audio_inputs)
+    text_inputs = processor.tokenizer(  # type: ignore
+        processed_texts,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+    )
+    return BatchFeature(text_inputs | audio_inputs).to(model.device)
