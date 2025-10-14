@@ -196,30 +196,6 @@ class QwenOmniWithMimi(PreTrainedModel):
 
         self.audio_token_id = config.audio_token_id
 
-    @classmethod
-    def from_parts(
-        cls,
-        mimi: MimiModel,
-        adaptor: MimiToQwenOmniAdaptor,
-        text_model: Qwen2_5OmniThinkerTextModel | Qwen3OmniMoeThinkerTextModel,
-        audio_token_id: int,
-    ) -> Self:
-        print("here 5")
-        config = QwenOmniWithMimiConfig(
-            mimi_config=mimi.config,
-            adaptor_config=adaptor.config,
-            text_model_config=text_model.config,
-            audio_token_id=audio_token_id,
-        )
-        model = cast(Self, object.__new__(cls))
-        PreTrainedModel.__init__(model, config)
-        model.config = config
-        model.mimi = mimi
-        model.adaptor = adaptor
-        model.text_model = text_model
-        model.audio_token_id = audio_token_id
-        return model
-
     def get_audio_features(
         self,
         audio_codes: torch.Tensor,
@@ -418,7 +394,7 @@ class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
         self.process_audio = self.model.process_audio
 
     @classmethod
-    def from_paths(
+    def from_paths_to_parts(
         cls,
         text_model_name_or_path: str | PathLike,
         adaptor_config_path: str | PathLike,
@@ -457,15 +433,24 @@ class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
         else:
             raise NotImplementedError("`text_model_name_or_path` must be a variant of `Qwen2.5-Omni` or `Qwen3OmniMoe`.")
 
-        base_model = QwenOmniWithMimi.from_parts(
-            mimi=mimi,
-            adaptor=adaptor,
-            text_model=thinker.model,
+        config = QwenOmniWithMimiConfig(
+            mimi_config=mimi.config,
+            adaptor_config=adaptor.config,
+            text_model_config=thinker.model.config,
             audio_token_id=thinker.config.audio_token_id,
         )
+
+        base_model = object.__new__(QwenOmniWithMimi)
+        PreTrainedModel.__init__(base_model, config)
+        base_model.config = config
+        base_model.mimi = mimi
+        base_model.adaptor = adaptor
+        base_model.text_model = thinker.model
+        base_model.audio_token_id = thinker.config.audio_token_id
+
         model = cast(Self, object.__new__(cls))
-        PreTrainedModel.__init__(model, base_model.config)
-        model.config = base_model.config
+        PreTrainedModel.__init__(model, config)
+        model.config = config
         model.model = base_model
         model.lm_head = thinker.lm_head
         model.process_text = base_model.process_text
@@ -622,12 +607,13 @@ class QwenOmniWithMimiAudioOutput(nn.Module):
             raise NotImplementedError("`text_model_name_or_path` must be a variant of `Qwen2.5-Omni` or `Qwen3OmniMoe`.")
 
         text_model = thinker.model
-        self.model = QwenOmniWithMimi.from_parts(
-            mimi=mimi,
-            adaptor=adaptor,
-            text_model=text_model,
-            audio_token_id=thinker.config.audio_token_id,
-        )
+        self.model: QwenOmniWithMimi = ...  # type: ignore
+        # QwenOmniWithMimi.from_parts(
+        #     mimi=mimi,
+        #     adaptor=adaptor,
+        #     text_model=text_model,
+        #     audio_token_id=thinker.config.audio_token_id,
+        # )
         self.text_vocab_size = text_model.config.vocab_size
         assert self.text_vocab_size == thinker.lm_head.out_features
         self.lm_head = nn.Linear(
