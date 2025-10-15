@@ -24,7 +24,6 @@ uv run accelerate launch \
   --per_device_eval_batch_size 64 \
   --eval_accumulation_steps 16 \
   --disable_tqdm False \
-  --data_path ../../../../mnt/efs/fs1/extracted_audio_features/ \
-  --final_filename saves/adaptor.pt \
+  --data_path ../../../../mnt/efs/fs1/extracted_audio_features/Qwen/Qwen3-Omni-30B-A3B-Instruct/ \
+  --final_filename saves/qwen3-adaptor.pt \
   --max_eval_dataset_size 8192 \
-  --lag_timesteps 1 \

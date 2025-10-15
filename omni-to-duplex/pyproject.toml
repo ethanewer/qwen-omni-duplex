@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.12.0",
     "qwen-omni-utils>=0.0.8",
     "soundfile>=0.13.1",
+    "tensorboard>=2.20.0",
     "torch>=2.8.0",
     "torchaudio>=2.8.0",
     "torchvision>=0.23.0",

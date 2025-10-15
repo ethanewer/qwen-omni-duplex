@@ -1,7 +1,7 @@
 {
     "input_size": 512,
-    "output_size": 1024,
-    "output_time_scale": 2,
+    "output_size": 2048,
+    "output_time_scale": 1,
     "lag_timesteps": 1,
     "decoder_config": {
         "architectures": [

@@ -1,3 +1,0 @@
-from transformers import Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor
-
-print(Qwen3OmniMoeForConditionalGeneration, Qwen3OmniMoeProcessor)
