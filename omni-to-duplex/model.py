@@ -326,46 +326,6 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             rope_deltas=self.rope_deltas,
         )
 
-    def process_text(
-        self,
-        text: str | list[str],
-        audio_codes: Optional[torch.Tensor] = None,
-        audio_codes_mask: Optional[torch.Tensor] = None,
-        audio_token: str = "<|AUDIO|>",
-    ) -> str | list[str]:
-        if audio_codes is not None:
-            output_time_scale = self.adaptor.output_time_scale
-            if audio_codes_mask is not None:
-                audio_lengths = iter((output_time_scale * audio_codes_mask.sum(dim=1)).floor().long())
-            else:
-                audio_lengths = iter([int(output_time_scale * audio_codes.shape[1])])
-        else:
-            audio_lengths = iter([])
-
-        if isinstance(text, list):
-            is_batch = True
-        else:
-            is_batch = False
-            text = [text]
-
-        processed_text = []
-        for sample in text:
-            assert isinstance(sample, str)
-            positions = []
-            special_tokens = [re.escape(audio_token)]
-            pattern = "|".join(special_tokens)
-            positions = sorted([(match.start(), match.group()) for match in re.finditer(pattern, sample)])
-            positions.sort(key=lambda x: x[0])
-
-            for _, special_token in positions:
-                if special_token == audio_token:
-                    sample = sample.replace(audio_token, "<|audio_placeholder|>" * next(audio_lengths), 1)
-
-            sample = sample.replace("<|audio_placeholder|>", audio_token)
-            processed_text.append(sample)
-
-        return processed_text if is_batch else processed_text[0]
-
     def process_audio(
         self,
         audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
@@ -395,8 +355,8 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             audio = pad_sequence(audio, batch_first=True)
             assert audio.ndim == 2
 
-            mimi_param = next(iter(self.audio_encoder.parameters()))
-            audio = audio[:, None].to(mimi_param.device, mimi_param.dtype)
+            param = next(iter(self.audio_encoder.parameters()))
+            audio = audio[:, None].to(param.device, param.dtype)
 
             if isinstance(self.audio_encoder, MimiModel):
                 outputs = self.audio_encoder.encode(
@@ -440,7 +400,6 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
             bias=False,
             dtype=self.model.dtype,
         )
-        self.process_text = self.model.process_text
         self.process_audio = self.model.process_audio
 
     @classmethod
@@ -507,7 +466,6 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         model.config = config
         model.model = base_model
         model.lm_head = thinker.lm_head
-        model.process_text = base_model.process_text
         model.process_audio = base_model.process_audio
         return model
 
@@ -560,6 +518,46 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
             audio_past_key_values=outputs.audio_past_key_values,
             rope_deltas=outputs.rope_deltas,
         )
+
+    def process_text(
+        self,
+        text: str | list[str],
+        audio_codes: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
+        audio_token: str = "<|AUDIO|>",
+    ) -> str | list[str]:
+        if audio_codes is not None:
+            output_time_scale = self.model.adaptor.output_time_scale
+            if audio_codes_mask is not None:
+                audio_lengths = iter((output_time_scale * audio_codes_mask.sum(dim=1)).floor().long())
+            else:
+                audio_lengths = iter([int(output_time_scale * audio_codes.shape[1])])
+        else:
+            audio_lengths = iter([])
+
+        if isinstance(text, list):
+            is_batch = True
+        else:
+            is_batch = False
+            text = [text]
+
+        processed_text = []
+        for sample in text:
+            assert isinstance(sample, str)
+            positions = []
+            special_tokens = [re.escape(audio_token)]
+            pattern = "|".join(special_tokens)
+            positions = sorted([(match.start(), match.group()) for match in re.finditer(pattern, sample)])
+            positions.sort(key=lambda x: x[0])
+
+            for _, special_token in positions:
+                if special_token == audio_token:
+                    sample = sample.replace(audio_token, "<|audio_placeholder|>" * next(audio_lengths), 1)
+
+            sample = sample.replace("<|audio_placeholder|>", audio_token)
+            processed_text.append(sample)
+
+        return processed_text if is_batch else processed_text[0]
 
     @torch.inference_mode()
     def generate_greedy(
@@ -636,3 +634,99 @@ def process_qwen_with_mimi_inputs(
         padding_side="left",
     )
     return BatchFeature(text_inputs | audio_inputs).to(model.device)
+
+
+class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncoder):
+    config: QwenWithCausalAudioEncoderConfig
+
+    def get_inputs_embeds(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        audio_codes: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
+        audio_past_key_values: Optional[Cache] = None,
+        audio_use_cache: Optional[bool] = None,
+    ) -> tuple[torch.Tensor, Optional[Cache]]:
+        assert input_ids is not None or audio_codes is not None
+        inputs_embeds = torch.tensor(0, dtype=self.dtype, device=self.device)
+        audio_past_key_values = None
+
+        if input_ids is not None:
+            inputs_embeds += self.text_model.get_input_embeddings()(input_ids)
+
+        if audio_codes is not None:
+            num_audio_streams = audio_codes.shape[1] if audio_codes.ndim == 4 else 1
+            audio_codes = audio_codes.view(-1, *audio_codes.shape[-2:])
+            batch_size, seq_len = audio_codes.shape[:2]
+            audio_adaptor_outputs = self.get_audio_features(
+                audio_codes=audio_codes,
+                audio_codes_mask=audio_codes_mask,
+                audio_past_key_values=audio_past_key_values,
+                audio_use_cache=audio_use_cache,
+            )
+            assert audio_adaptor_outputs.logits is not None
+            audio_inputs_embeds = audio_adaptor_outputs.logits.view(batch_size, num_audio_streams, seq_len, -1)
+            audio_past_key_values = audio_adaptor_outputs.past_key_values
+
+            if audio_codes_mask is not None:
+                audio_inputs_embeds[audio_codes_mask] *= 0
+
+            inputs_embeds += audio_inputs_embeds.sum(dim=0)
+
+        return inputs_embeds, audio_past_key_values
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        audio_codes: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        audio_past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        rope_deltas: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        audio_use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.Tensor] = None,
+    ) -> QwenWithCausalAudioEncoderOutputWithPast:
+        if inputs_embeds is None:
+            inputs_embeds, audio_past_key_values = self.get_inputs_embeds(
+                input_ids=input_ids,
+                audio_codes=audio_codes,
+                audio_codes_mask=audio_codes_mask,
+                audio_past_key_values=audio_past_key_values,
+                audio_use_cache=audio_use_cache,
+            )
+        else:
+            assert input_ids is None and audio_codes is None
+
+        if attention_mask is not None and position_ids is None:
+            if cache_position is None or (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
+                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
+                position_ids, rope_deltas = self.get_rope_index(attention_mask)
+                rope_deltas = rope_deltas - delta0
+                self.rope_deltas = rope_deltas
+            else:
+                batch_size, seq_length = inputs_embeds.shape[:2]
+                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
+                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
+                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
+                position_ids = position_ids.add(delta)
+                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+
+        outputs = self.text_model(
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            inputs_embeds=inputs_embeds,
+            use_cache=use_cache,
+            cache_position=cache_position,
+        )
+
+        return QwenWithCausalAudioEncoderOutputWithPast(
+            last_hidden_state=outputs[0],
+            past_key_values=outputs.past_key_values,
+            audio_past_key_values=audio_past_key_values,
+            rope_deltas=self.rope_deltas,
+        )
