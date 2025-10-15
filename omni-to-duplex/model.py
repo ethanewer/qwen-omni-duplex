@@ -211,6 +211,7 @@ class QwenWithCausalAudioEncoderOutputWithPast(ModelOutput):
     loss: Optional[torch.Tensor] = None
     last_hidden_state: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    audio_code_logits: Optional[torch.Tensor] = None
     past_key_values: Optional[Cache] = None
     audio_past_key_values: Optional[Cache] = None
 
@@ -551,7 +552,7 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
             audio_inputs_embeds = audio_adaptor_outputs.logits.view(batch_size, num_audio_streams, seq_len, -1)
             audio_past_key_values = audio_adaptor_outputs.past_key_values
             if audio_adaptor_outputs.mask is not None:
-                audio_inputs_embeds[audio_adaptor_outputs.mask] *= 0
+                audio_inputs_embeds[audio_adaptor_outputs.mask].zero_()
 
             if inputs_embeds is not None:
                 inputs_embeds += audio_inputs_embeds.sum(dim=0)
@@ -599,6 +600,75 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
             last_hidden_state=outputs[0],
             past_key_values=outputs.past_key_values,
             audio_past_key_values=audio_past_key_values,
+        )
+
+
+class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedModel):
+    config: QwenWithCausalAudioEncoderConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model = QwenWithCausalAudioEncoderAndParallelInputStreams(config)
+        self.lm_head = nn.Linear(
+            in_features=config.text_model_config.hidden_size,
+            out_features=config.text_model_config.vocab_size,
+            bias=False,
+            dtype=self.model.dtype,
+        )
+        self.audio_code_head = nn.Linear(
+            in_features=config.text_model_config.hidden_size,
+            out_features=config.audio_encoder_config.codebook_size,
+            bias=False,
+            dtype=self.model.dtype,
+        )
+
+    def forward(
+        self,
+        input_ids: Optional[torch.Tensor] = None,
+        audio_codes: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        audio_codes_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        audio_past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        use_cache: Optional[bool] = None,
+        audio_use_cache: Optional[bool] = None,
+        cache_position: Optional[torch.Tensor] = None,
+    ) -> QwenWithCausalAudioEncoderOutputWithPast:
+        outputs: QwenWithCausalAudioEncoderOutputWithPast = self.model(
+            input_ids=input_ids,
+            audio_codes=audio_codes,
+            attention_mask=attention_mask,
+            audio_codes_mask=audio_codes_mask,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            audio_past_key_values=audio_past_key_values,
+            inputs_embeds=inputs_embeds,
+            audio_use_cache=audio_use_cache,
+            use_cache=use_cache,
+            cache_position=cache_position,
+        )
+
+        text_logits = self.lm_head(outputs.last_hidden_state)
+        audio_code_logits = self.audio_code_head(outputs.last_hidden_state)
+
+        if labels is not None:
+            loss = self.model.text_model.loss_function(
+                logits=text_logits,
+                labels=labels,
+                vocab_size=self.model.text_model.config.get_text_config().vocab_size,
+            )
+        else:
+            loss = None
+
+        return QwenWithCausalAudioEncoderOutputWithPast(
+            loss=loss,
+            logits=text_logits,
+            audio_code_logits=audio_code_logits,
+            past_key_values=outputs.past_key_values,
+            audio_past_key_values=outputs.audio_past_key_values,
         )
 
 
