@@ -528,12 +528,11 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
         audio_past_key_values: Optional[Cache] = None,
         audio_use_cache: Optional[bool] = None,
     ) -> tuple[torch.Tensor, Optional[Cache]]:
-        assert input_ids is not None or audio_codes is not None
-        inputs_embeds = torch.tensor(0, dtype=self.dtype, device=self.device)
+        inputs_embeds = None
         audio_past_key_values = None
 
         if input_ids is not None:
-            inputs_embeds += self.text_model.get_input_embeddings()(input_ids)
+            inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
 
         if audio_codes is not None:
             num_audio_streams = audio_codes.shape[1] if audio_codes.ndim == 4 else 1
@@ -554,8 +553,12 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
             if audio_adaptor_outputs.mask is not None:
                 audio_inputs_embeds[audio_adaptor_outputs.mask] *= 0
 
-            inputs_embeds += audio_inputs_embeds.sum(dim=0)
+            if inputs_embeds is not None:
+                inputs_embeds += audio_inputs_embeds.sum(dim=0)
+            else:
+                inputs_embeds = audio_inputs_embeds.sum(dim=0)
 
+        assert inputs_embeds is not None
         return inputs_embeds, audio_past_key_values
 
     def forward(

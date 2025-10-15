@@ -5,7 +5,7 @@ uv run accelerate launch \
   --do_train True \
   --do_eval True \
   --num_train_epochs 1 \
-  --max_steps 250000 \
+  --max_steps 50000 \
   --fp16 False \
   --bf16 True \
   --tf32 False \
