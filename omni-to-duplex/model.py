@@ -150,7 +150,7 @@ class EmbeddingAdaptor(PreTrainedModel):
         )
 
 
-class QwenOmniWithMimiConfig(PretrainedConfig):
+class QwenWithCausalAudioEncoderConfig(PretrainedConfig):
     audio_encoder_config: MimiConfig | EncodecConfig
     adaptor_config: EmbeddingAdaptorConfig
     text_model_config: Qwen2_5OmniTextConfig | Qwen3OmniMoeTextConfig
@@ -195,7 +195,7 @@ class QwenOmniWithMimiConfig(PretrainedConfig):
 
 
 @dataclass
-class QwenOmniWithMimiOutputWithPast(ModelOutput):
+class QwenWithCausalAudioEncoderOutputWithPast(ModelOutput):
     loss: Optional[torch.Tensor] = None
     last_hidden_state: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
@@ -204,10 +204,10 @@ class QwenOmniWithMimiOutputWithPast(ModelOutput):
     rope_deltas: Optional[torch.Tensor] = None
 
 
-class QwenOmniWithMimi(PreTrainedModel):
-    config: QwenOmniWithMimiConfig
+class QwenWithCausalAudioEncoder(PreTrainedModel):
+    config: QwenWithCausalAudioEncoderConfig
 
-    def __init__(self, config: QwenOmniWithMimiConfig) -> None:
+    def __init__(self, config: QwenWithCausalAudioEncoderConfig) -> None:
         super().__init__(config)
         self.config = config
 
@@ -270,7 +270,7 @@ class QwenOmniWithMimi(PreTrainedModel):
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> QwenOmniWithMimiOutputWithPast:
+    ) -> QwenWithCausalAudioEncoderOutputWithPast:
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
@@ -319,7 +319,7 @@ class QwenOmniWithMimi(PreTrainedModel):
             cache_position=cache_position,
         )
 
-        return QwenOmniWithMimiOutputWithPast(
+        return QwenWithCausalAudioEncoderOutputWithPast(
             last_hidden_state=outputs[0],
             past_key_values=outputs.past_key_values,
             audio_past_key_values=audio_outputs.past_key_values if audio_outputs is not None else None,
@@ -427,13 +427,13 @@ class QwenOmniWithMimi(PreTrainedModel):
         return BatchFeature({"audio_codes": audio_codes, "audio_codes_mask": audio_codes_mask}).to(self.text_model.device)
 
 
-class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
-    config: QwenOmniWithMimiConfig
+class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
+    config: QwenWithCausalAudioEncoderConfig
 
-    def __init__(self, config: QwenOmniWithMimiConfig) -> None:
+    def __init__(self, config: QwenWithCausalAudioEncoderConfig) -> None:
         super().__init__(config)
         self.config = config
-        self.model = QwenOmniWithMimi._from_config(config)
+        self.model = QwenWithCausalAudioEncoder._from_config(config)
         self.lm_head = nn.Linear(
             in_features=config.text_model_config.hidden_size,
             out_features=config.text_model_config.vocab_size,
@@ -487,14 +487,14 @@ class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
         else:
             raise NotImplementedError("`text_model_name_or_path` must be a variant of `Qwen2.5-Omni` or `Qwen3OmniMoe`.")
 
-        config = QwenOmniWithMimiConfig(
+        config = QwenWithCausalAudioEncoderConfig(
             audio_encoder_config=audio_encoder.config,
             adaptor_config=adaptor.config,
             text_model_config=thinker.model.config,
             audio_token_id=thinker.config.audio_token_id,
         )
 
-        base_model = object.__new__(QwenOmniWithMimi)
+        base_model = object.__new__(QwenWithCausalAudioEncoder)
         PreTrainedModel.__init__(base_model, config)
         base_model.config = config
         base_model.audio_encoder = audio_encoder
@@ -526,8 +526,8 @@ class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> QwenOmniWithMimiOutputWithPast:
-        outputs: QwenOmniWithMimiOutputWithPast = self.model(
+    ) -> QwenWithCausalAudioEncoderOutputWithPast:
+        outputs: QwenWithCausalAudioEncoderOutputWithPast = self.model(
             input_ids=input_ids,
             audio_codes=audio_codes,
             attention_mask=attention_mask,
@@ -553,7 +553,7 @@ class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
         else:
             loss = None
 
-        return QwenOmniWithMimiOutputWithPast(
+        return QwenWithCausalAudioEncoderOutputWithPast(
             loss=loss,
             logits=logits,
             past_key_values=outputs.past_key_values,
@@ -609,7 +609,7 @@ class QwenOmniWithMimiForConditionalGeneration(PreTrainedModel):
 
 
 def process_qwen_with_mimi_inputs(
-    model: QwenOmniWithMimiForConditionalGeneration,
+    model: QwenWithCausalAudioEncoderForConditionalGeneration,
     processor: Qwen2_5OmniProcessor | Qwen3OmniMoeProcessor,
     conversation: list[dict] | list[list[dict]],
     audio: Optional[torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray]] = None,
