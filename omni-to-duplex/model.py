@@ -10,6 +10,7 @@ import torchaudio.functional
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from transformers import (
+    AutoModelForCausalLM,
     BatchFeature,
     Cache,
     DynamicCache,
@@ -23,6 +24,7 @@ from transformers import (
     Qwen2_5OmniThinkerTextModel,
     Qwen3Config,
     Qwen3Model,
+    Qwen3MoeConfig,
     Qwen3OmniMoeProcessor,
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextModel,
@@ -35,6 +37,20 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeTextConfig,
 )
 from transformers.utils.generic import ModelOutput
+
+TEXT_MODEL_CONFIGS = {
+    Qwen3Config.model_type: Qwen3Config,
+    Qwen3MoeConfig.model_type: Qwen3MoeConfig,
+    Qwen3OmniMoeTextConfig.model_type: Qwen3OmniMoeTextConfig,
+    Qwen2_5OmniTextConfig.model_type: Qwen2_5OmniTextConfig,
+}
+
+TEXT_MODELS = {
+    Qwen3Config.model_type: Qwen3Model,
+    Qwen3MoeConfig.model_type: Qwen3MoeConfig,
+    Qwen3OmniMoeTextConfig.model_type: Qwen3OmniMoeThinkerTextModel,
+    Qwen2_5OmniTextConfig.model_type: Qwen2_5OmniThinkerTextModel,
+}
 
 
 class EmbeddingAdaptorConfig(PretrainedConfig):
@@ -175,13 +191,7 @@ class QwenWithCausalAudioEncoderConfig(PretrainedConfig):
             config.adaptor_config = EmbeddingAdaptorConfig(**config.adaptor_config)
 
         if hasattr(config, "text_model_config") and isinstance(config.text_model_config, dict):
-            model_type = config.text_model_config["model_type"]
-            if model_type == Qwen2_5OmniTextConfig.model_type:
-                config.text_model_config = Qwen2_5OmniTextConfig(**config.text_model_config)
-            elif model_type == Qwen3OmniMoeTextConfig.model_type:
-                config.text_model_config = Qwen3OmniMoeTextConfig(**config.text_model_config)
-            else:
-                raise NotImplementedError(f"`text_model.model_type={model_type}` is not supported.")
+            config.text_model_config = TEXT_MODEL_CONFIGS[config.text_model_config["model_type"]](**config.text_model_config)
 
         return config
 
@@ -201,7 +211,6 @@ class QwenWithCausalAudioEncoderOutputWithPast(ModelOutput):
     logits: Optional[torch.Tensor] = None
     past_key_values: Optional[Cache] = None
     audio_past_key_values: Optional[Cache] = None
-    rope_deltas: Optional[torch.Tensor] = None
 
 
 class QwenWithCausalAudioEncoder(PreTrainedModel):
@@ -218,13 +227,7 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             self.audio_encoder = EncodecModel._from_config(config.audio_encoder_config)
 
         self.adaptor = EmbeddingAdaptor._from_config(config.adaptor_config)
-
-        text_model_type = config.text_model_config.model_type
-        if text_model_type == Qwen2_5OmniTextConfig.model_type:
-            self.text_model = Qwen2_5OmniThinkerTextModel._from_config(config.text_model_config)
-        elif text_model_type == Qwen3OmniMoeTextConfig.model_type:
-            self.text_model = Qwen3OmniMoeThinkerTextModel._from_config(config.text_model_config)
-
+        self.text_model = TEXT_MODELS[config.text_model_config.model_type]._from_config(config.text_model_config)
         self.audio_token_id = config.audio_token_id
 
     def get_audio_features(
@@ -248,14 +251,6 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             use_cache=audio_use_cache,
         )
 
-    def get_rope_index(self, attention_mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        position_ids = attention_mask.long().cumsum(-1) - 1
-        position_ids.masked_fill_(attention_mask == 0, 1)
-        position_ids = position_ids.unsqueeze(0).expand(3, -1, -1).to(attention_mask.device)
-        max_position_ids = position_ids.max(dim=0, keepdim=False)[0].max(dim=-1, keepdim=True)[0]
-        mrope_position_deltas = max_position_ids + 1 - torch.sum(attention_mask, dim=-1, keepdim=True)
-        return position_ids, mrope_position_deltas
-
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -266,7 +261,6 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
         past_key_values: Optional[Cache] = None,
         audio_past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        rope_deltas: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
@@ -296,20 +290,6 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
 
-        if attention_mask is not None and position_ids is None:
-            if cache_position is None or (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
-                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
-                position_ids, rope_deltas = self.get_rope_index(attention_mask)
-                rope_deltas = rope_deltas - delta0
-                self.rope_deltas = rope_deltas
-            else:
-                batch_size, seq_length = inputs_embeds.shape[:2]
-                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                position_ids = position_ids.add(delta)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-
         outputs = self.text_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -323,7 +303,6 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             last_hidden_state=outputs[0],
             past_key_values=outputs.past_key_values,
             audio_past_key_values=audio_outputs.past_key_values if audio_outputs is not None else None,
-            rope_deltas=self.rope_deltas,
         )
 
     def process_audio(
@@ -402,73 +381,6 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         )
         self.process_audio = self.model.process_audio
 
-    @classmethod
-    def from_paths_to_parts(
-        cls,
-        text_model_name_or_path: str | PathLike,
-        adaptor_config_path: str | PathLike,
-        audio_encoder_name_or_path: str | PathLike = "kyutai/mimi",
-        adaptor_state_dict_path: Optional[str | PathLike] = None,
-        dtype: torch.dtype = torch.bfloat16,
-        attn_implementation: str = "sdpa",
-    ) -> Self:
-        adaptor_config = EmbeddingAdaptorConfig.from_json_file(adaptor_config_path)
-        adaptor_config.decoder_config._attn_implementation = attn_implementation
-
-        if "mimi" in str(audio_encoder_name_or_path):
-            audio_encoder = MimiModel.from_pretrained(
-                audio_encoder_name_or_path,
-                dtype=dtype,
-                attn_implementation=attn_implementation,
-            )
-        else:
-            audio_encoder = EncodecModel.from_pretrained(audio_encoder_name_or_path, dtype=dtype)
-
-        for param in audio_encoder.parameters():
-            param.requires_grad = False
-
-        adaptor = EmbeddingAdaptor._from_config(adaptor_config, dtype=dtype)
-        if adaptor_state_dict_path is not None:
-            adaptor.load_state_dict(torch.load(adaptor_state_dict_path, map_location="cpu"))
-
-        if "Qwen2.5" in str(text_model_name_or_path):
-            thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
-                text_model_name_or_path,
-                dtype=dtype,
-                attn_implementation=attn_implementation,
-            )
-        elif "Qwen3" in str(text_model_name_or_path):
-            thinker = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
-                text_model_name_or_path,
-                dtype=dtype,
-                attn_implementation=attn_implementation,
-            )
-        else:
-            raise NotImplementedError("`text_model_name_or_path` must be a variant of `Qwen2.5-Omni` or `Qwen3OmniMoe`.")
-
-        config = QwenWithCausalAudioEncoderConfig(
-            audio_encoder_config=audio_encoder.config,
-            adaptor_config=adaptor.config,
-            text_model_config=thinker.model.config,
-            audio_token_id=thinker.config.audio_token_id,
-        )
-
-        base_model = object.__new__(QwenWithCausalAudioEncoder)
-        PreTrainedModel.__init__(base_model, config)
-        base_model.config = config
-        base_model.audio_encoder = audio_encoder
-        base_model.adaptor = adaptor
-        base_model.text_model = thinker.model
-        base_model.audio_token_id = thinker.config.audio_token_id
-
-        model = cast(Self, object.__new__(cls))
-        PreTrainedModel.__init__(model, config)
-        model.config = config
-        model.model = base_model
-        model.lm_head = thinker.lm_head
-        model.process_audio = base_model.process_audio
-        return model
-
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -479,7 +391,6 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         past_key_values: Optional[Cache] = None,
         audio_past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        rope_deltas: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
@@ -494,7 +405,6 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
             past_key_values=past_key_values,
             audio_past_key_values=audio_past_key_values,
             inputs_embeds=inputs_embeds,
-            rope_deltas=rope_deltas,
             audio_use_cache=audio_use_cache,
             use_cache=use_cache,
             cache_position=cache_position,
@@ -516,7 +426,6 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
             logits=logits,
             past_key_values=outputs.past_key_values,
             audio_past_key_values=outputs.audio_past_key_values,
-            rope_deltas=outputs.rope_deltas,
         )
 
     def process_text(
@@ -606,36 +515,6 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         return sequences
 
 
-def process_qwen_with_mimi_inputs(
-    model: QwenWithCausalAudioEncoderForConditionalGeneration,
-    processor: Qwen2_5OmniProcessor | Qwen3OmniMoeProcessor,
-    conversation: list[dict] | list[list[dict]],
-    audio: Optional[torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray]] = None,
-    audio_sample_rate: Optional[int | list[int]] = None,
-    add_generation_prompt: bool = False,
-) -> BatchFeature:
-    assert len(conversation) > 0
-    if audio:
-        if isinstance(audio, list):
-            audio = [torch.from_numpy(a) if isinstance(a, np.ndarray) else a for a in audio]
-        elif isinstance(audio, np.ndarray):
-            audio = torch.from_numpy(audio)
-
-        audio_inputs = model.process_audio(audio=audio, audio_sample_rate=audio_sample_rate)  # type: ignore
-    else:
-        audio_inputs = {}
-
-    texts = processor.apply_chat_template(conversation, add_generation_prompt=add_generation_prompt, tokenize=False)
-    processed_texts = model.process_text(texts, **audio_inputs)
-    text_inputs = processor.tokenizer(  # type: ignore
-        processed_texts,
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-    )
-    return BatchFeature(text_inputs | audio_inputs).to(model.device)
-
-
 class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncoder):
     config: QwenWithCausalAudioEncoderConfig
 
@@ -685,7 +564,6 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
         past_key_values: Optional[Cache] = None,
         audio_past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
-        rope_deltas: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
@@ -701,20 +579,6 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
         else:
             assert input_ids is None and audio_codes is None
 
-        if attention_mask is not None and position_ids is None:
-            if cache_position is None or (cache_position is not None and cache_position[0] == 0) or self.rope_deltas is None:
-                delta0 = (1 - attention_mask).sum(dim=-1).unsqueeze(1)
-                position_ids, rope_deltas = self.get_rope_index(attention_mask)
-                rope_deltas = rope_deltas - delta0
-                self.rope_deltas = rope_deltas
-            else:
-                batch_size, seq_length = inputs_embeds.shape[:2]
-                delta = cache_position[0] + self.rope_deltas if cache_position is not None else 0
-                position_ids = torch.arange(seq_length, device=inputs_embeds.device)
-                position_ids = position_ids.view(1, -1).expand(batch_size, -1)
-                position_ids = position_ids.add(delta)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-
         outputs = self.text_model(
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -728,5 +592,105 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
             last_hidden_state=outputs[0],
             past_key_values=outputs.past_key_values,
             audio_past_key_values=audio_past_key_values,
-            rope_deltas=self.rope_deltas,
         )
+
+
+def process_qwen_with_causal_audio_encoder_inputs(
+    model: QwenWithCausalAudioEncoderForConditionalGeneration,
+    processor: Qwen2_5OmniProcessor | Qwen3OmniMoeProcessor,
+    conversation: list[dict] | list[list[dict]],
+    audio: Optional[torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray]] = None,
+    audio_sample_rate: Optional[int | list[int]] = None,
+    add_generation_prompt: bool = False,
+) -> BatchFeature:
+    assert len(conversation) > 0
+    if audio:
+        if isinstance(audio, list):
+            audio = [torch.from_numpy(a) if isinstance(a, np.ndarray) else a for a in audio]
+        elif isinstance(audio, np.ndarray):
+            audio = torch.from_numpy(audio)
+
+        audio_inputs = model.process_audio(audio=audio, audio_sample_rate=audio_sample_rate)  # type: ignore
+    else:
+        audio_inputs = {}
+
+    texts = processor.apply_chat_template(conversation, add_generation_prompt=add_generation_prompt, tokenize=False)
+    processed_texts = model.process_text(texts, **audio_inputs)
+    text_inputs = processor.tokenizer(  # type: ignore
+        processed_texts,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+    )
+    return BatchFeature(text_inputs | audio_inputs).to(model.device)
+
+
+def build_qwen_with_causal_audio_encoder_for_conditional_generation(
+    text_model_name_or_path: str | PathLike,
+    adaptor_config_path: str | PathLike,
+    audio_encoder_name_or_path: str | PathLike = "kyutai/mimi",
+    adaptor_state_dict_path: Optional[str | PathLike] = None,
+    dtype: torch.dtype = torch.bfloat16,
+    attn_implementation: str = "sdpa",
+) -> QwenWithCausalAudioEncoderForConditionalGeneration:
+    adaptor_config = EmbeddingAdaptorConfig.from_json_file(adaptor_config_path)
+    adaptor_config.decoder_config._attn_implementation = attn_implementation
+
+    if "mimi" in str(audio_encoder_name_or_path):
+        audio_encoder = MimiModel.from_pretrained(
+            audio_encoder_name_or_path,
+            dtype=dtype,
+            attn_implementation=attn_implementation,
+        )
+    else:
+        audio_encoder = EncodecModel.from_pretrained(audio_encoder_name_or_path, dtype=dtype)
+
+    for param in audio_encoder.parameters():
+        param.requires_grad = False
+
+    adaptor = EmbeddingAdaptor._from_config(adaptor_config, dtype=dtype)
+    if adaptor_state_dict_path is not None:
+        adaptor.load_state_dict(torch.load(adaptor_state_dict_path, map_location="cpu"))
+
+    if "Omni" in str(text_model_name_or_path):
+        if "Qwen3" in str(text_model_name_or_path):
+            thinker = Qwen3OmniMoeThinkerForConditionalGeneration.from_pretrained(
+                text_model_name_or_path,
+                dtype=dtype,
+                attn_implementation=attn_implementation,
+            )
+        else:
+            thinker = Qwen2_5OmniThinkerForConditionalGeneration.from_pretrained(
+                text_model_name_or_path,
+                dtype=dtype,
+                attn_implementation=attn_implementation,
+            )
+    else:
+        thinker = AutoModelForCausalLM.from_pretrained(
+            text_model_name_or_path,
+            dtype=dtype,
+            attn_implementation=attn_implementation,
+        )
+
+    config = QwenWithCausalAudioEncoderConfig(
+        audio_encoder_config=audio_encoder.config,
+        adaptor_config=adaptor.config,
+        text_model_config=thinker.model.config,
+        audio_token_id=thinker.config.audio_token_id,
+    )
+
+    base_model = object.__new__(QwenWithCausalAudioEncoder)
+    PreTrainedModel.__init__(base_model, config)
+    base_model.config = config
+    base_model.audio_encoder = audio_encoder
+    base_model.adaptor = adaptor
+    base_model.text_model = thinker.model
+    base_model.audio_token_id = thinker.config.audio_token_id
+
+    model = object.__new__(QwenWithCausalAudioEncoderForConditionalGeneration)
+    PreTrainedModel.__init__(model, config)
+    model.config = config
+    model.model = base_model
+    model.lm_head = thinker.lm_head
+    model.process_audio = base_model.process_audio
+    return model
