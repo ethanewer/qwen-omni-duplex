@@ -48,7 +48,7 @@ class RunArguments:
 
 class FeatureShardIterableDataset(IterableDataset):
     def __init__(self, shard_paths: list[Path], max_size: Optional[int] = None):
-        self.shard_paths = sorted([p for p in shard_paths if p.suffix == ".pt"])
+        self.shard_paths = sorted([p for p in shard_paths if p.suffix == ".pt"], key=lambda p: str(p)[::-1])
         self.max_size = max_size
         if not self.shard_paths:
             raise FileNotFoundError("No .pt shards found.")

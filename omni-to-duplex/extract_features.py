@@ -131,7 +131,10 @@ def main() -> None:
 
     audio_encoder.eval()
 
-    data_files = sorted([p for p in tts_data_path.iterdir() if p.is_file() and p.suffix in [".tar"]])
+    data_files = sorted(
+        [p for p in tts_data_path.iterdir() if p.is_file() and p.suffix in [".tar"]],
+        key=lambda p: str(p)[::-1],
+    )
 
     for tar_path in tqdm(data_files, desc="Processing files"):
         try:
