@@ -17,7 +17,7 @@ from transformers.hf_argparser import HfArgumentParser
 from transformers.trainer import Trainer
 from transformers.training_args import TrainingArguments
 
-from model import MimiToQwenOmniAdaptor, MimiToQwenOmniAdaptorConfig
+from model import EmbeddingAdaptor, EmbeddingAdaptorConfig
 
 
 def debug_xml(obj, name: str) -> None:
@@ -29,7 +29,7 @@ def debug_xml(obj, name: str) -> None:
 class RunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
     adaptor_config_path: str = field(
-        default="configs/qwen3-30b-a3b-adaptor-config.json",
+        default="configs/mimi-to-qwen3-30b-a3b-adaptor-config.json",
         metadata={"help": "Path to config JSON file."},
     )
     attn_implementation: Optional[str] = field(
@@ -42,8 +42,8 @@ class RunArguments:
     final_filename: str = field(default="adaptor.pt", metadata={"help": "Filename of final saved adaptor weights."})
 
     @property
-    def adaptor_config(self) -> MimiToQwenOmniAdaptorConfig:
-        return MimiToQwenOmniAdaptorConfig.from_json_file(self.adaptor_config_path)
+    def adaptor_config(self) -> EmbeddingAdaptorConfig:
+        return EmbeddingAdaptorConfig.from_json_file(self.adaptor_config_path)
 
 
 class FeatureShardIterableDataset(IterableDataset):
@@ -69,7 +69,9 @@ class FeatureShardIterableDataset(IterableDataset):
             gc.collect()
 
 
-def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int, output_time_scale: int) -> dict[str, Any]:
+def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int, output_time_scale: float) -> dict[str, Any]:
+    max_output_seq_len = int(max_input_seq_len * output_time_scale)
+
     inputs: list[torch.Tensor] = []
     targets: list[torch.Tensor] = []
     masks: list[torch.Tensor] = []
@@ -79,21 +81,21 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int, ou
         y: torch.Tensor = b["qwen_omni_features"]
         output_mask = torch.ones_like(y[:, :1])
 
-        max_pairs = min(x.shape[0], y.shape[0] // output_time_scale, max_input_seq_len)
+        max_pairs = min(x.shape[0], int(y.shape[0] / output_time_scale), max_input_seq_len)
         if max_pairs == 0:
             continue
         elif x.shape[0] > max_input_seq_len:
             x = x[:max_input_seq_len]
-            y = y[: output_time_scale * max_input_seq_len]
-            output_mask = output_mask[: output_time_scale * max_input_seq_len]
+            y = y[:max_output_seq_len]
+            output_mask = output_mask[:max_output_seq_len]
         elif x.shape[0] < max_input_seq_len:
             x = F.pad(x, (0, 0, 0, max_input_seq_len - x.shape[0]), value=0)
-            y = F.pad(y, (0, 0, 0, output_time_scale * max_input_seq_len - y.shape[0]), value=0)
-            output_mask = F.pad(output_mask, (0, 0, 0, output_time_scale * max_input_seq_len - output_mask.shape[0]), value=0)
+            y = F.pad(y, (0, 0, 0, max_output_seq_len - y.shape[0]), value=0)
+            output_mask = F.pad(output_mask, (0, 0, 0, max_output_seq_len - output_mask.shape[0]), value=0)
 
         assert x.shape[0] == max_input_seq_len
-        assert y.shape[0] == output_time_scale * max_input_seq_len
-        assert output_mask.shape[0] == output_time_scale * max_input_seq_len
+        assert y.shape[0] == max_output_seq_len
+        assert output_mask.shape[0] == max_output_seq_len
 
         inputs.append(x)
         targets.append(y)
@@ -155,7 +157,7 @@ def main() -> None:
     eval_dataset = FeatureShardIterableDataset(shard_paths[-1:], max_size=run_args.max_eval_dataset_size)
 
     adaptor_config = run_args.adaptor_config
-    model: nn.Module = MimiToQwenOmniAdaptor(adaptor_config)
+    model: nn.Module = EmbeddingAdaptor(adaptor_config)
     if run_args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)  # type: ignore
 
