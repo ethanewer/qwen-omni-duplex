@@ -84,6 +84,7 @@ class EmbeddingAdaptorConfig(PretrainedConfig):
 class EmbeddingAdaptorOutputWithPast(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    mask: Optional[torch.Tensor] = None
     past_key_values: Optional[Cache] = None
 
 
@@ -162,6 +163,7 @@ class EmbeddingAdaptor(PreTrainedModel):
         return EmbeddingAdaptorOutputWithPast(
             loss=loss,
             logits=output_embeds,
+            mask=attention_mask,
             past_key_values=decoder_outputs.past_key_values,
         )
 
@@ -536,6 +538,9 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
         if audio_codes is not None:
             num_audio_streams = audio_codes.shape[1] if audio_codes.ndim == 4 else 1
             audio_codes = audio_codes.view(-1, *audio_codes.shape[-2:])
+            if audio_codes_mask is not None:
+                audio_codes_mask = audio_codes_mask.view(-1, audio_codes_mask.shape[-1])
+
             batch_size, seq_len = audio_codes.shape[:2]
             audio_adaptor_outputs = self.get_audio_features(
                 audio_codes=audio_codes,
@@ -546,9 +551,8 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
             assert audio_adaptor_outputs.logits is not None
             audio_inputs_embeds = audio_adaptor_outputs.logits.view(batch_size, num_audio_streams, seq_len, -1)
             audio_past_key_values = audio_adaptor_outputs.past_key_values
-
-            if audio_codes_mask is not None:
-                audio_inputs_embeds[audio_codes_mask] *= 0
+            if audio_adaptor_outputs.mask is not None:
+                audio_inputs_embeds[audio_adaptor_outputs.mask] *= 0
 
             inputs_embeds += audio_inputs_embeds.sum(dim=0)
 
