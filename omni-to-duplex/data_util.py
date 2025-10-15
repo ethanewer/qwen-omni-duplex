@@ -11,12 +11,15 @@ import torch
 import torchaudio
 from qwen_omni_utils import process_mm_info
 from transformers import (
+    EncodecModel,
+    MimiModel,
     Qwen2_5OmniForConditionalGeneration,
     Qwen2_5OmniProcessor,
     Qwen3OmniMoeForConditionalGeneration,
     Qwen3OmniMoeProcessor,
 )
-from transformers.models.mimi.modeling_mimi import MimiEncoderOutput, MimiModel
+from transformers.models.encodec.modeling_encodec import EncodecEncoderOutput
+from transformers.models.mimi.modeling_mimi import MimiEncoderOutput
 
 
 @dataclass
@@ -96,16 +99,22 @@ def iter_audio_samples(path: str | Path) -> Generator[AudioSample, None, None]:
 
 
 @torch.inference_mode()
-def get_quantized_mimi_features(mimi: MimiModel, sample: AudioSample) -> torch.Tensor:
-    mimi_param = next(iter(mimi.parameters()))
-    audio = sample.to_tensor(new_sample_rate=24000)
+def get_quantized_audio_features(audio_encoder: MimiModel | EncodecModel, sample: AudioSample) -> torch.Tensor:
+    param = next(iter(audio_encoder.parameters()))
+    audio = sample.to_tensor(new_sample_rate=audio_encoder.config.sampling_rate).to(param.device, param.dtype)
     while audio.ndim < 3:
         audio = audio[None]
 
-    mimi_outputs = mimi.encode(audio.to(mimi_param.device, mimi_param.dtype), num_quantizers=8)
-    assert isinstance(mimi_outputs, MimiEncoderOutput) and mimi_outputs.audio_codes is not None
-    audio_codes = mimi_outputs.audio_codes
-    return mimi.quantizer.decode(audio_codes)[0].T
+    if isinstance(audio_encoder, MimiModel):
+        outputs = audio_encoder.encode(audio, num_quantizers=8)
+        assert isinstance(outputs, MimiEncoderOutput) and outputs.audio_codes is not None
+        return audio_encoder.quantizer.decode(outputs.audio_codes)[0].T
+    elif isinstance(audio_encoder, EncodecModel):
+        outputs = audio_encoder.encode(audio, bandwidth=audio_encoder.config.target_bandwidths[0])
+        assert isinstance(outputs, EncodecEncoderOutput) and outputs.audio_codes is not None
+        return audio_encoder.quantizer.decode(outputs.audio_codes.view(outputs.audio_codes.shape[-3:]))[0].T
+    else:
+        raise ValueError
 
 
 @torch.inference_mode()
@@ -114,9 +123,9 @@ def get_qwen_omni_features(
     processor: Qwen2_5OmniProcessor | Qwen3OmniMoeProcessor,
     sample: AudioSample,
 ) -> torch.Tensor:
-    qwen_omni_param = next(iter(qwen_omni.parameters()))
+    param = next(iter(qwen_omni.parameters()))
     conversation = [{"role": "user", "content": [{"type": "audio", "audio": sample.audio}]}]
     audios, _, _ = process_mm_info(conversation, use_audio_in_video=True)  # type: ignore
     inputs = processor(text="", audio=audios, return_tensors="pt", padding=True, use_audio_in_video=True)  # type: ignore
-    inputs = inputs.to(qwen_omni_param.device, qwen_omni_param.dtype)
+    inputs = inputs.to(param.device, param.dtype)
     return qwen_omni.thinker.get_audio_features(inputs.input_features, inputs.feature_attention_mask)
