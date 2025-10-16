@@ -436,7 +436,7 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         text: str | list[str],
         audio_codes: Optional[torch.Tensor] = None,
         audio_codes_mask: Optional[torch.Tensor] = None,
-        audio_token: str = "<|AUDIO|>",
+        audio_token: str = "<|audio_pad|>",
     ) -> str | list[str]:
         if audio_codes is not None:
             output_time_scale = self.model.adaptor.output_time_scale
@@ -692,7 +692,7 @@ def process_qwen_with_causal_audio_encoder_inputs(
         audio_inputs = {}
 
     texts = processor.apply_chat_template(conversation, add_generation_prompt=add_generation_prompt, tokenize=False)
-    processed_texts = model.process_text(texts, **audio_inputs)
+    processed_texts = model.process_text(texts, **audio_inputs, audio_token=processor.audio_token)
     text_inputs = processor.tokenizer(  # type: ignore
         processed_texts,
         return_tensors="pt",
