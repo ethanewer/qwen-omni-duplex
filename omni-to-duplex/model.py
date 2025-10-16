@@ -29,6 +29,7 @@ from transformers import (
     Qwen3OmniMoeThinkerForConditionalGeneration,
     Qwen3OmniMoeThinkerTextModel,
 )
+from transformers.loss.loss_utils import ForCausalLMLoss
 from transformers.modeling_utils import PreTrainedModel
 from transformers.models.encodec.modeling_encodec import EncodecEncoderOutput
 from transformers.models.mimi.modeling_mimi import MimiEncoderOutput
@@ -83,7 +84,7 @@ class EmbeddingAdaptorConfig(PretrainedConfig):
 @dataclass
 class EmbeddingAdaptorOutputWithPast(ModelOutput):
     loss: Optional[torch.Tensor] = None
-    logits: Optional[torch.Tensor] = None
+    output_embeds: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
     past_key_values: Optional[Cache] = None
 
@@ -162,7 +163,7 @@ class EmbeddingAdaptor(PreTrainedModel):
 
         return EmbeddingAdaptorOutputWithPast(
             loss=loss,
-            logits=output_embeds,
+            output_embeds=output_embeds,
             mask=attention_mask,
             past_key_values=decoder_outputs.past_key_values,
         )
@@ -282,9 +283,7 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
                     audio_past_key_values=audio_past_key_values,
                     audio_use_cache=audio_use_cache,
                 )
-                audio_features = audio_outputs.logits
-                assert audio_features is not None
-
+                assert (audio_features := audio_outputs.output_embeds) is not None
                 audio_mask = (input_ids == self.audio_token_id) | (input_ids >= self.text_model.config.vocab_size)
                 audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
@@ -375,6 +374,7 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
     def __init__(self, config: QwenWithCausalAudioEncoderConfig) -> None:
         super().__init__(config)
         self.config = config
+        self.vocab_size = config.text_model_config.vocab_size
         self.model = QwenWithCausalAudioEncoder._from_config(config)
         self.lm_head = nn.Linear(
             in_features=config.text_model_config.hidden_size,
@@ -415,14 +415,9 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
 
         logits = self.lm_head(outputs.last_hidden_state)
 
+        loss = None
         if labels is not None:
-            loss = self.model.text_model.loss_function(
-                logits=logits,
-                labels=labels,
-                vocab_size=self.model.text_model.config.get_text_config().vocab_size,
-            )
-        else:
-            loss = None
+            loss = ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.vocab_size)
 
         return QwenWithCausalAudioEncoderOutputWithPast(
             loss=loss,
@@ -536,28 +531,32 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
             inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
 
         if audio_codes is not None:
+            batch_size = audio_codes.shape[0]
             num_audio_streams = audio_codes.shape[1] if audio_codes.ndim == 4 else 1
-            audio_codes = audio_codes.view(-1, *audio_codes.shape[-2:])
-            if audio_codes_mask is not None:
-                audio_codes_mask = audio_codes_mask.view(-1, audio_codes_mask.shape[-1])
+            input_seq_len = audio_codes.shape[-2]
+            output_seq_len = int(input_seq_len * self.adaptor.output_time_scale)
 
-            batch_size, seq_len = audio_codes.shape[:2]
-            audio_adaptor_outputs = self.get_audio_features(
+            audio_codes = audio_codes.view(batch_size * num_audio_streams, input_seq_len, -1)
+            if audio_codes_mask is not None:
+                audio_codes_mask = audio_codes_mask.view(batch_size * num_audio_streams, input_seq_len)
+
+            audio_outputs = self.get_audio_features(
                 audio_codes=audio_codes,
                 audio_codes_mask=audio_codes_mask,
                 audio_past_key_values=audio_past_key_values,
                 audio_use_cache=audio_use_cache,
             )
-            assert audio_adaptor_outputs.logits is not None
-            audio_inputs_embeds = audio_adaptor_outputs.logits.view(batch_size, num_audio_streams, seq_len, -1)
-            audio_past_key_values = audio_adaptor_outputs.past_key_values
-            if audio_adaptor_outputs.mask is not None:
-                audio_inputs_embeds[audio_adaptor_outputs.mask].zero_()
+            assert (audio_inputs_embeds := audio_outputs.output_embeds) is not None
+            audio_past_key_values = audio_outputs.past_key_values
 
-            if inputs_embeds is not None:
-                inputs_embeds += audio_inputs_embeds.sum(dim=0)
+            if audio_outputs.mask is not None:
+                audio_inputs_embeds[audio_outputs.mask == 0].zero_()
+
+            audio_inputs_embeds = audio_inputs_embeds.view(batch_size, num_audio_streams, output_seq_len, -1).sum(dim=1)
+            if inputs_embeds is None:
+                inputs_embeds = audio_inputs_embeds
             else:
-                inputs_embeds = audio_inputs_embeds.sum(dim=0)
+                inputs_embeds += audio_inputs_embeds
 
         assert inputs_embeds is not None
         return inputs_embeds, audio_past_key_values
@@ -603,11 +602,19 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
         )
 
 
+class QwenWithCausalAudioOutputWithPast(QwenWithCausalAudioEncoderOutputWithPast):
+    audio_code_logits: Optional[torch.Tensor] = None
+
+
 class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedModel):
     config: QwenWithCausalAudioEncoderConfig
 
-    def __init__(self, config):
+    def __init__(self, config: QwenWithCausalAudioEncoderConfig) -> None:
         super().__init__(config)
+        self.config = config
+        self.vocab_size = config.text_model_config.vocab_size
+        self.codebook_size = config.audio_encoder_config.codebook_size
+
         self.model = QwenWithCausalAudioEncoderAndParallelInputStreams(config)
         self.lm_head = nn.Linear(
             in_features=config.text_model_config.hidden_size,
@@ -617,7 +624,7 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
         )
         self.audio_code_head = nn.Linear(
             in_features=config.text_model_config.hidden_size,
-            out_features=config.audio_encoder_config.codebook_size,
+            out_features=int(self.codebook_size / config.adaptor_config.output_time_scale),
             bias=False,
             dtype=self.model.dtype,
         )
@@ -633,10 +640,11 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
         audio_past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
+        audio_code_labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> QwenWithCausalAudioEncoderOutputWithPast:
+    ) -> QwenWithCausalAudioOutputWithPast:
         outputs: QwenWithCausalAudioEncoderOutputWithPast = self.model(
             input_ids=input_ids,
             audio_codes=audio_codes,
@@ -653,17 +661,20 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
 
         text_logits = self.lm_head(outputs.last_hidden_state)
         audio_code_logits = self.audio_code_head(outputs.last_hidden_state)
+        audio_code_logits = audio_code_logits.view(audio_code_logits.shape[0], -1, self.codebook_size)
 
+        loss = None
         if labels is not None:
-            loss = self.model.text_model.loss_function(
-                logits=text_logits,
-                labels=labels,
-                vocab_size=self.model.text_model.config.get_text_config().vocab_size,
-            )
-        else:
-            loss = None
+            loss = ForCausalLMLoss(logits=text_logits, labels=labels, vocab_size=self.vocab_size)
 
-        return QwenWithCausalAudioEncoderOutputWithPast(
+        if audio_code_labels is not None:
+            audio_code_loss = ForCausalLMLoss(logits=audio_code_logits, labels=audio_code_labels, vocab_size=self.codebook_size)
+            if loss is None:
+                loss = audio_code_loss
+            else:
+                loss += audio_code_loss
+
+        return QwenWithCausalAudioOutputWithPast(
             loss=loss,
             logits=text_logits,
             audio_code_logits=audio_code_logits,

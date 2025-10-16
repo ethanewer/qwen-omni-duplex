@@ -109,19 +109,7 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int, ou
 
 
 def compute_metrics(eval_pred):
-    preds = eval_pred.predictions
-
-    if isinstance(eval_pred.label_ids, (tuple, list)):
-        targets, output_mask = eval_pred.label_ids
-    else:
-        targets = eval_pred.label_ids
-        output_mask = None
-
-    if output_mask is not None:
-        assert isinstance(output_mask, np.ndarray)
-    else:
-        output_mask = np.ones_like(targets[:, :, :1])
-
+    preds, targets, output_mask = eval_pred.label_ids
     assert isinstance(preds, np.ndarray) and isinstance(targets, np.ndarray) and isinstance(output_mask, np.ndarray)
 
     if preds.shape[1] != targets.shape[1]:
@@ -141,7 +129,7 @@ def parse_args() -> tuple[RunArguments, TrainingArguments]:
     parser = HfArgumentParser((RunArguments, TrainingArguments))  # type: ignore
     run_args, training_args = parser.parse_args_into_dataclasses()  # type: ignore
     training_args.remove_unused_columns = False
-    training_args.label_names = ["targets", "output_mask"]  # type: ignore
+    training_args.label_names = ["output_embeds", "targets", "output_mask"]  # type: ignore
     return run_args, training_args
 
 
