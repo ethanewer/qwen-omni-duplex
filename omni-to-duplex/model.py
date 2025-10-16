@@ -3,7 +3,6 @@ from dataclasses import dataclass
 from os import PathLike
 from typing import Optional, Self, cast
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torchaudio.functional
@@ -226,12 +225,12 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
 
         audio_encoder_type = config.audio_encoder_config.model_type
         if audio_encoder_type == MimiConfig.model_type:
-            self.audio_encoder = MimiModel._from_config(config.audio_encoder_config)
+            self.audio_encoder = MimiModel(cast(MimiConfig, config.audio_encoder_config))
         elif audio_encoder_type == EncodecConfig.model_type:
-            self.audio_encoder = EncodecModel._from_config(config.audio_encoder_config)
+            self.audio_encoder = EncodecModel(cast(EncodecConfig, config.audio_encoder_config))
 
-        self.adaptor = EmbeddingAdaptor._from_config(config.adaptor_config)
-        self.text_model = TEXT_MODELS[config.text_model_config.model_type]._from_config(config.text_model_config)
+        self.adaptor = EmbeddingAdaptor(config.adaptor_config)
+        self.text_model = TEXT_MODELS[config.text_model_config.model_type](config.text_model_config)
         self.audio_token_id = config.audio_token_id
 
     def get_audio_features(
@@ -268,13 +267,14 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> QwenWithCausalAudioEncoderOutputWithPast:
         if inputs_embeds is None:
             assert input_ids is not None
             inputs_embeds = self.text_model.get_input_embeddings()(input_ids)
             assert inputs_embeds is not None
 
-        audio_outputs = None
+        audio_past_key_values = None
         if input_ids is not None and input_ids.shape[1] != 1:
             if audio_codes is not None:
                 audio_outputs = self.get_audio_features(
@@ -288,6 +288,7 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
                 audio_mask = audio_mask.unsqueeze(-1).expand_as(inputs_embeds).to(inputs_embeds.device)
                 audio_features = audio_features.to(inputs_embeds.device, inputs_embeds.dtype)
                 inputs_embeds = inputs_embeds.masked_scatter(audio_mask, audio_features)
+                audio_past_key_values = audio_outputs.past_key_values
 
             if attention_mask is not None:
                 attention_mask = attention_mask.to(inputs_embeds.device)
@@ -299,45 +300,39 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            **kwargs,
         )
 
-        return QwenWithCausalAudioEncoderOutputWithPast(
-            last_hidden_state=outputs[0],
-            past_key_values=outputs.past_key_values,
-            audio_past_key_values=audio_outputs.past_key_values if audio_outputs is not None else None,
-        )
+        return QwenWithCausalAudioEncoderOutputWithPast(**outputs, audio_past_key_values=audio_past_key_values)
 
     def process_audio(
         self,
-        audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
-        audio_sample_rate: Optional[int | list[int]] = None,
+        audio: Optional[torch.Tensor] = None,
+        audio_lengths: Optional[torch.Tensor] = None,
+        sampling_rate: Optional[int] = None,
     ) -> BatchFeature:
+        audio_codes = None
+        audio_codes_mask = None
         if audio is not None:
-            if not isinstance(audio, list):
-                audio = [audio]
-
-            if audio_sample_rate is not None:
-                if isinstance(audio_sample_rate, int):
-                    audio_sample_rate = [audio_sample_rate] * len(audio)
-
-                assert len(audio) == len(audio_sample_rate)
-                for i in range(len(audio)):
-                    if audio_sample_rate[i] != self.audio_encoder.config.sampling_rate:
-                        audio[i] = torchaudio.functional.resample(
-                            audio[i],
-                            orig_freq=audio_sample_rate[i],
-                            new_freq=self.audio_encoder.config.sampling_rate,
-                        )
-
-            audio_mask = pad_sequence(
-                [torch.ones(a.shape, dtype=torch.long, device=a.device) for a in audio],
-                batch_first=True,
-            )
-            audio = pad_sequence(audio, batch_first=True)
-            assert audio.ndim == 2
-
             param = next(iter(self.audio_encoder.parameters()))
-            audio = audio[:, None].to(param.device, param.dtype)
+            audio = audio.to(param.device, param.dtype)
+
+            if audio.ndim == 1:
+                audio = audio[None, None]
+            else:
+                audio = audio[:, None]
+
+            if sampling_rate is not None and sampling_rate != self.audio_encoder.config.sampling_rate:
+                audio = torchaudio.functional.resample(
+                    audio,
+                    orig_freq=sampling_rate,
+                    new_freq=self.audio_encoder.config.sampling_rate,
+                )
+
+            audio_mask = None
+            if audio_lengths is not None:
+                indices = torch.arange(audio.shape[-1], device=audio.device)
+                audio_mask = (indices[None] < audio_lengths[:, None]).long()
 
             if isinstance(self.audio_encoder, MimiModel):
                 outputs = self.audio_encoder.encode(
@@ -357,13 +352,11 @@ class QwenWithCausalAudioEncoder(PreTrainedModel):
             assert isinstance(outputs, MimiEncoderOutput) or isinstance(outputs, EncodecEncoderOutput)
             assert outputs.audio_codes is not None
             audio_codes = outputs.audio_codes.view(outputs.audio_codes.shape[-3:]).transpose(1, 2)
-            samples_per_code = int(self.audio_encoder.config.sampling_rate / self.audio_encoder.config._frame_rate)  # type: ignore
-            assert samples_per_code * self.audio_encoder.config._frame_rate == self.audio_encoder.config.sampling_rate  # type: ignore
-            padded_audio_mask = F.pad(audio_mask, (0, audio_codes.shape[1] * samples_per_code - audio_mask.shape[1]))
-            audio_codes_mask = padded_audio_mask.view(-1, audio_codes.shape[1], samples_per_code).any(dim=-1)
-        else:
-            audio_codes = None
-            audio_codes_mask = None
+            if audio_mask is not None:
+                samples_per_code = int(self.audio_encoder.config.sampling_rate / self.audio_encoder.config._frame_rate)  # type: ignore
+                assert samples_per_code * self.audio_encoder.config._frame_rate == self.audio_encoder.config.sampling_rate  # type: ignore
+                padded_audio_mask = F.pad(audio_mask, (0, audio_codes.shape[1] * samples_per_code - audio_mask.shape[1]))
+                audio_codes_mask = padded_audio_mask.view(-1, audio_codes.shape[1], samples_per_code).any(dim=-1)
 
         return BatchFeature({"audio_codes": audio_codes, "audio_codes_mask": audio_codes_mask}).to(self.text_model.device)
 
@@ -375,7 +368,7 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         super().__init__(config)
         self.config = config
         self.vocab_size = config.text_model_config.vocab_size
-        self.model = QwenWithCausalAudioEncoder._from_config(config)
+        self.model = QwenWithCausalAudioEncoder(config)
         self.lm_head = nn.Linear(
             in_features=config.text_model_config.hidden_size,
             out_features=config.text_model_config.vocab_size,
@@ -398,6 +391,7 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> QwenWithCausalAudioEncoderOutputWithPast:
         outputs: QwenWithCausalAudioEncoderOutputWithPast = self.model(
             input_ids=input_ids,
@@ -411,6 +405,7 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
             audio_use_cache=audio_use_cache,
             use_cache=use_cache,
             cache_position=cache_position,
+            **kwargs,
         )
 
         logits = self.lm_head(outputs.last_hidden_state)
@@ -419,12 +414,7 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         if labels is not None:
             loss = ForCausalLMLoss(logits=logits, labels=labels, vocab_size=self.vocab_size)
 
-        return QwenWithCausalAudioEncoderOutputWithPast(
-            loss=loss,
-            logits=logits,
-            past_key_values=outputs.past_key_values,
-            audio_past_key_values=outputs.audio_past_key_values,
-        )
+        return QwenWithCausalAudioEncoderOutputWithPast(**outputs, loss=loss, logits=logits)
 
     def process_text(
         self,
@@ -578,6 +568,7 @@ class QwenDuplexModel(QwenWithCausalAudioEncoder):
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> QwenWithCausalAudioEncoderOutputWithPast:
         if inputs_embeds is None:
             inputs_embeds, audio_past_key_values = self.get_inputs_embeds(
@@ -597,13 +588,10 @@ class QwenDuplexModel(QwenWithCausalAudioEncoder):
             inputs_embeds=inputs_embeds,
             use_cache=use_cache,
             cache_position=cache_position,
+            **kwargs,
         )
 
-        return QwenDuplexOutputWithPast(
-            last_hidden_state=outputs[0],
-            past_key_values=outputs.past_key_values,
-            audio_past_key_values=audio_past_key_values,
-        )
+        return QwenDuplexOutputWithPast(**outputs, audio_past_key_values=audio_past_key_values)
 
 
 class QwenDuplexModelForCausalLM(PreTrainedModel):
@@ -628,6 +616,7 @@ class QwenDuplexModelForCausalLM(PreTrainedModel):
             bias=False,
             dtype=self.model.dtype,
         )
+        self.process_audio = self.model.process_audio
 
     def forward(
         self,
@@ -644,6 +633,7 @@ class QwenDuplexModelForCausalLM(PreTrainedModel):
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> QwenDuplexOutputWithPast:
         outputs: QwenDuplexOutputWithPast = self.model(
             input_ids=input_ids,
@@ -657,6 +647,7 @@ class QwenDuplexModelForCausalLM(PreTrainedModel):
             audio_use_cache=audio_use_cache,
             use_cache=use_cache,
             cache_position=cache_position,
+            **kwargs,
         )
 
         text_logits = self.lm_head(outputs.last_hidden_state)
@@ -674,31 +665,25 @@ class QwenDuplexModelForCausalLM(PreTrainedModel):
             else:
                 loss += audio_code_loss
 
-        return QwenDuplexOutputWithPast(
-            loss=loss,
-            logits=text_logits,
-            audio_code_logits=audio_code_logits,
-            past_key_values=outputs.past_key_values,
-            audio_past_key_values=outputs.audio_past_key_values,
-        )
+        return QwenDuplexOutputWithPast(**outputs, loss=loss, logits=text_logits, audio_code_logits=audio_code_logits)
 
 
 def process_qwen_with_causal_audio_encoder_inputs(
     model: QwenWithCausalAudioEncoderForConditionalGeneration,
     processor: Qwen2_5OmniProcessor | Qwen3OmniMoeProcessor,
     conversation: list[dict] | list[list[dict]],
-    audio: Optional[torch.Tensor | np.ndarray | list[torch.Tensor | np.ndarray]] = None,
-    audio_sample_rate: Optional[int | list[int]] = None,
+    audio: Optional[torch.Tensor | list[torch.Tensor]] = None,
+    sampling_rate: Optional[int] = None,
     add_generation_prompt: bool = False,
 ) -> BatchFeature:
     assert len(conversation) > 0
     if audio:
+        audio_lengths = None
         if isinstance(audio, list):
-            audio = [torch.from_numpy(a) if isinstance(a, np.ndarray) else a for a in audio]
-        elif isinstance(audio, np.ndarray):
-            audio = torch.from_numpy(audio)
+            audio_lengths = torch.tensor([a.shape[-1] for a in audio], device=model.device)
+            audio = pad_sequence(audio, batch_first=True).to(model.device, model.dtype)
 
-        audio_inputs = model.process_audio(audio=audio, audio_sample_rate=audio_sample_rate)  # type: ignore
+        audio_inputs = model.process_audio(audio=audio, audio_lengths=audio_lengths, sampling_rate=sampling_rate)
     else:
         audio_inputs = {}
 
