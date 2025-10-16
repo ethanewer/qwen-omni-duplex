@@ -1,7 +1,7 @@
 import re
 from dataclasses import dataclass
 from os import PathLike
-from typing import Optional, Self, cast
+from typing import Optional, cast
 
 import numpy as np
 import torch
@@ -73,12 +73,12 @@ class EmbeddingAdaptorConfig(PretrainedConfig):
         return config
 
     @classmethod
-    def from_json_file(cls: type[Self], *args, **kwargs) -> Self:
-        return cast(Self, cls.fix_config(PretrainedConfig.from_json_file(*args, **kwargs)))
+    def from_json_file(cls, *args, **kwargs) -> "EmbeddingAdaptorConfig":
+        return cast("EmbeddingAdaptorConfig", cls.fix_config(PretrainedConfig.from_json_file(*args, **kwargs)))
 
     @classmethod
-    def from_pretrained(cls: type[Self], *args, **kwargs) -> Self:
-        return cast(Self, cls.fix_config(PretrainedConfig.from_pretrained(*args, **kwargs)))
+    def from_pretrained(cls, *args, **kwargs) -> "EmbeddingAdaptorConfig":
+        return cast("EmbeddingAdaptorConfig", cls.fix_config(PretrainedConfig.from_pretrained(*args, **kwargs)))
 
 
 @dataclass
@@ -199,12 +199,12 @@ class QwenWithCausalAudioEncoderConfig(PretrainedConfig):
         return config
 
     @classmethod
-    def from_json_file(cls: type[Self], *args, **kwargs) -> Self:
-        return cast(Self, cls.fix_config(PretrainedConfig.from_json_file(*args, **kwargs)))
+    def from_json_file(cls, *args, **kwargs) -> "QwenWithCausalAudioEncoderConfig":
+        return cast("QwenWithCausalAudioEncoderConfig", cls.fix_config(PretrainedConfig.from_json_file(*args, **kwargs)))
 
     @classmethod
-    def from_pretrained(cls: type[Self], *args, **kwargs) -> Self:
-        return cast(Self, cls.fix_config(PretrainedConfig.from_pretrained(*args, **kwargs)))
+    def from_pretrained(cls, *args, **kwargs) -> "QwenWithCausalAudioEncoderConfig":
+        return cast("QwenWithCausalAudioEncoderConfig", cls.fix_config(PretrainedConfig.from_pretrained(*args, **kwargs)))
 
 
 @dataclass
@@ -640,7 +640,7 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
         audio_past_key_values: Optional[Cache] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
-        audio_code_labels: Optional[torch.Tensor] = None,
+        audio_codes_labels: Optional[torch.Tensor] = None,
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
@@ -667,8 +667,10 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
         if labels is not None:
             loss = ForCausalLMLoss(logits=text_logits, labels=labels, vocab_size=self.vocab_size)
 
-        if audio_code_labels is not None:
-            audio_code_loss = ForCausalLMLoss(logits=audio_code_logits, labels=audio_code_labels, vocab_size=self.codebook_size)
+        if audio_codes_labels is not None:
+            audio_code_loss = ForCausalLMLoss(
+                logits=audio_code_logits, labels=audio_codes_labels, vocab_size=self.codebook_size
+            )
             if loss is None:
                 loss = audio_code_loss
             else:
