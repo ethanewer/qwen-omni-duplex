@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 \
 uv run accelerate launch \
   --config_file configs/fsdp-config-4-gpu.yaml \
   train_adaptor.py \
@@ -24,6 +24,6 @@ uv run accelerate launch \
   --per_device_eval_batch_size 64 \
   --eval_accumulation_steps 16 \
   --disable_tqdm False \
-  --data_path ../../../../mnt/efs/fs1/extracted_audio_features/Qwen/Qwen3-Omni-30B-A3B-Instruct/ \
-  --final_filename saves/qwen3-adaptor.pt \
+  --data_path ../../../../mnt/efs/fs1/extracted_audio_features/Voila-Tokenizer-to-Qwen3-Omni-30B-A3B-Instruct \
+  --final_filename saves/voila-tokenizer-to-qwen3-omni-adaptor.pt \
   --max_eval_dataset_size 8192 \

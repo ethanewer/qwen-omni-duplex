@@ -513,7 +513,11 @@ class QwenWithCausalAudioEncoderForConditionalGeneration(PreTrainedModel):
         return sequences
 
 
-class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncoder):
+class QwenDuplexOutputWithPast(QwenWithCausalAudioEncoderOutputWithPast):
+    audio_code_logits: Optional[torch.Tensor] = None
+
+
+class QwenDuplexModel(QwenWithCausalAudioEncoder):
     config: QwenWithCausalAudioEncoderConfig
 
     def get_inputs_embeds(
@@ -595,18 +599,14 @@ class QwenWithCausalAudioEncoderAndParallelInputStreams(QwenWithCausalAudioEncod
             cache_position=cache_position,
         )
 
-        return QwenWithCausalAudioEncoderOutputWithPast(
+        return QwenDuplexOutputWithPast(
             last_hidden_state=outputs[0],
             past_key_values=outputs.past_key_values,
             audio_past_key_values=audio_past_key_values,
         )
 
 
-class QwenWithCausalAudioOutputWithPast(QwenWithCausalAudioEncoderOutputWithPast):
-    audio_code_logits: Optional[torch.Tensor] = None
-
-
-class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedModel):
+class QwenDuplexModelForCausalLM(PreTrainedModel):
     config: QwenWithCausalAudioEncoderConfig
 
     def __init__(self, config: QwenWithCausalAudioEncoderConfig) -> None:
@@ -615,7 +615,7 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
         self.vocab_size = config.text_model_config.vocab_size
         self.codebook_size = config.audio_encoder_config.codebook_size
 
-        self.model = QwenWithCausalAudioEncoderAndParallelInputStreams(config)
+        self.model = QwenDuplexModel(config)
         self.lm_head = nn.Linear(
             in_features=config.text_model_config.hidden_size,
             out_features=config.text_model_config.vocab_size,
@@ -644,8 +644,8 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
         use_cache: Optional[bool] = None,
         audio_use_cache: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> QwenWithCausalAudioOutputWithPast:
-        outputs: QwenWithCausalAudioEncoderOutputWithPast = self.model(
+    ) -> QwenDuplexOutputWithPast:
+        outputs: QwenDuplexOutputWithPast = self.model(
             input_ids=input_ids,
             audio_codes=audio_codes,
             attention_mask=attention_mask,
@@ -674,7 +674,7 @@ class QwenWithCausalAudioEncoderAndParallelInputStreamsForCausalLM(PreTrainedMod
             else:
                 loss += audio_code_loss
 
-        return QwenWithCausalAudioOutputWithPast(
+        return QwenDuplexOutputWithPast(
             loss=loss,
             logits=text_logits,
             audio_code_logits=audio_code_logits,

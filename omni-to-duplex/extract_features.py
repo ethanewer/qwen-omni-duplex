@@ -134,8 +134,12 @@ def main() -> None:
     data_files = sorted(
         [p for p in tts_data_path.iterdir() if p.is_file() and p.suffix in [".tar"]],
         key=lambda p: str(p)[::-1],
-        reverse=True,
     )
+
+    data_files = [p for p in data_files if any(s in str(p) for s in ["aihub14", "aihub_broadcast", "beluga", "aihub15"])]
+    print(f"{len(data_files)=}")
+    examples_paths = ", ".join([f"'{str(p)}'" for p in data_files[:50]])
+    print(f"<example_paths>{examples_paths}</example_paths>")
 
     for tar_path in tqdm(data_files, desc="Processing files"):
         try:
