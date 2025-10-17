@@ -83,9 +83,13 @@ class EmbeddingAdaptorConfig(PretrainedConfig):
 @dataclass
 class EmbeddingAdaptorOutputWithPast(ModelOutput):
     loss: Optional[torch.Tensor] = None
-    output_embeds: Optional[torch.Tensor] = None
+    logits: Optional[torch.Tensor] = None
     mask: Optional[torch.Tensor] = None
     past_key_values: Optional[Cache] = None
+
+    @property
+    def output_embeds(self):
+        return self.logits
 
 
 class EmbeddingAdaptor(PreTrainedModel):
@@ -162,7 +166,7 @@ class EmbeddingAdaptor(PreTrainedModel):
 
         return EmbeddingAdaptorOutputWithPast(
             loss=loss,
-            output_embeds=output_embeds,
+            logits=output_embeds,
             mask=attention_mask,
             past_key_values=decoder_outputs.past_key_values,
         )

@@ -29,14 +29,14 @@ def debug_xml(obj, name: str) -> None:
 class RunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
     adaptor_config_path: str = field(
-        default="configs/mimi-to-qwen3-30b-a3b-adaptor-config.json",
+        default="configs/viola-to-qwen3-30b-a3b-adaptor-config.json",
         metadata={"help": "Path to config JSON file."},
     )
     attn_implementation: Optional[str] = field(
         default="flash_attention_2",
         metadata={"help": "Must be 'flash_attention_2' for sliding window attention."},
     )
-    max_input_seq_len: int = field(default=512, metadata={"help": "Max input sequence length."})
+    max_input_seq_len: int = field(default=256, metadata={"help": "Max input sequence length."})
     max_eval_dataset_size: Optional[int] = field(default=None, metadata={"help": "Max eval dataset size."})
     compile: bool = field(default=False, metadata={"help": "Use torch.compile on the base adaptor."})
     final_filename: str = field(default="adaptor.pt", metadata={"help": "Filename of final saved adaptor weights."})
@@ -84,12 +84,16 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int, ou
         max_pairs = min(x.shape[0], int(y.shape[0] / output_time_scale), max_input_seq_len)
         if max_pairs == 0:
             continue
-        elif x.shape[0] > max_input_seq_len:
+
+        if x.shape[0] > max_input_seq_len:
             x = x[:max_input_seq_len]
-            y = y[:max_output_seq_len]
-            output_mask = output_mask[:max_output_seq_len]
         elif x.shape[0] < max_input_seq_len:
             x = F.pad(x, (0, 0, 0, max_input_seq_len - x.shape[0]), value=0)
+
+        if y.shape[0] > max_output_seq_len:
+            y = y[:max_output_seq_len]
+            output_mask = output_mask[:max_output_seq_len]
+        elif y.shape[0] < max_output_seq_len:
             y = F.pad(y, (0, 0, 0, max_output_seq_len - y.shape[0]), value=0)
             output_mask = F.pad(output_mask, (0, 0, 0, max_output_seq_len - output_mask.shape[0]), value=0)
 
@@ -109,7 +113,8 @@ def collate_fn_alignment(batch: list[dict[str, Any]], max_input_seq_len: int, ou
 
 
 def compute_metrics(eval_pred):
-    preds, targets, output_mask = eval_pred.label_ids
+    preds = eval_pred.predictions
+    targets, output_mask = eval_pred.label_ids
     assert isinstance(preds, np.ndarray) and isinstance(targets, np.ndarray) and isinstance(output_mask, np.ndarray)
 
     if preds.shape[1] != targets.shape[1]:
@@ -129,7 +134,7 @@ def parse_args() -> tuple[RunArguments, TrainingArguments]:
     parser = HfArgumentParser((RunArguments, TrainingArguments))  # type: ignore
     run_args, training_args = parser.parse_args_into_dataclasses()  # type: ignore
     training_args.remove_unused_columns = False
-    training_args.label_names = ["output_embeds", "targets", "output_mask"]  # type: ignore
+    training_args.label_names = ["targets", "output_mask"]  # type: ignore
     return run_args, training_args
 
 
