@@ -16,8 +16,6 @@ uv run accelerate launch \
   --logging_strategy steps \
   --logging_steps 25 \
   --dataloader_pin_memory True \
-  --dataloader_prefetch_factor 2048 \
-  --dataloader_persistent_workers True \
   --report_to tensorboard \
   --learning_rate 0.001 \
   --warmup_ratio 0.01 \
