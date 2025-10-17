@@ -5,7 +5,7 @@ uv run accelerate launch \
   --do_train True \
   --do_eval True \
   --num_train_epochs 1 \
-  --max_steps 10000 \
+  --max_steps 5000 \
   --fp16 False \
   --bf16 True \
   --tf32 False \
@@ -15,15 +15,19 @@ uv run accelerate launch \
   --save_strategy no \
   --logging_strategy steps \
   --logging_steps 25 \
+  --dataloader_pin_memory True \
+  --dataloader_prefetch_factor 2048 \
+  --dataloader_persistent_workers True \
   --report_to tensorboard \
   --learning_rate 0.001 \
   --warmup_ratio 0.01 \
   --lr_scheduler_type cosine \
-  --per_device_train_batch_size 64 \
+  --per_device_train_batch_size 128 \
   --gradient_accumulation_steps 1 \
-  --per_device_eval_batch_size 128 \
+  --per_device_eval_batch_size 256 \
   --eval_accumulation_steps 16 \
   --disable_tqdm False \
   --data_path ../../../../../mnt/efs/fs1/extracted_audio_features/Voila-Tokenizer-to-Qwen3-Omni-30B-A3B-Instruct \
-  --final_filename saves/voila-tokenizer-to-qwen3-omni-adaptor.pt \
+  --final_filename saves/voila-tokenizer-to-qwen3-omni-adaptor-v2.pt \
+  --checkpoint_path saves/voila-tokenizer-to-qwen3-omni-adaptor-v1.pt \
   --max_eval_dataset_size 4096 \

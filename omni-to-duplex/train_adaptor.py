@@ -29,7 +29,7 @@ def debug_xml(obj, name: str) -> None:
 class RunArguments:
     data_path: str = field(metadata={"help": "Path containing .pt shards."})
     adaptor_config_path: str = field(
-        default="configs/viola-to-qwen3-30b-a3b-adaptor-config.json",
+        default="configs/voila-to-qwen3-30b-a3b-adaptor-config.json",
         metadata={"help": "Path to config JSON file."},
     )
     attn_implementation: Optional[str] = field(
@@ -40,6 +40,7 @@ class RunArguments:
     max_eval_dataset_size: Optional[int] = field(default=None, metadata={"help": "Max eval dataset size."})
     compile: bool = field(default=False, metadata={"help": "Use torch.compile on the base adaptor."})
     final_filename: str = field(default="adaptor.pt", metadata={"help": "Filename of final saved adaptor weights."})
+    checkpoint_path: Optional[str] = field(default=None, metadata={"help": "Optional path model state dict."})
 
     @property
     def adaptor_config(self) -> EmbeddingAdaptorConfig:
@@ -151,6 +152,11 @@ def main() -> None:
 
     adaptor_config = run_args.adaptor_config
     model: nn.Module = EmbeddingAdaptor(adaptor_config)
+
+    if run_args.checkpoint_path is not None:
+        state_dict = torch.load(run_args.checkpoint_path, map_location="cpu")
+        model.load_state_dict(state_dict)
+
     if run_args.compile and hasattr(torch, "compile"):
         model = torch.compile(model)  # type: ignore
 
@@ -167,7 +173,7 @@ def main() -> None:
         ),
     )
 
-    trainer.train(resume_from_checkpoint=training_args.resume_from_checkpoint)
+    trainer.train()
 
     save_path = Path(run_args.final_filename)
     save_path.parent.mkdir(parents=True, exist_ok=True)
